@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =====================================================
-#   SSH Reverse Tunnel Manager v2.2
+#   SSH Reverse Tunnel Manager v2.3
 #   Usage: sudo bash setup.sh
 # =====================================================
 
@@ -27,7 +27,7 @@ banner() {
     clear
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║     SSH Reverse Tunnel Manager  v2.2         ║"
+    echo "  ║     SSH Reverse Tunnel Manager  v2.3         ║"
     echo "  ║     Iran  →  VPS  (SOCKS5 proxy support)     ║"
     echo "  ╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -50,81 +50,132 @@ ensure_config_dir() {
 }
 
 # ─────────────────────────────────────────────────────
-#  Ask for SOCKS5 proxy (used for installs + SSH)
+#  Restart sshd — handles ssh / sshd / openssh-server
 # ─────────────────────────────────────────────────────
 
-ask_proxy() {
-    echo ""
-    echo -e "  ${BOLD}Proxy Configuration${NC}"
-    echo -e "  Do you have a SOCKS5 proxy to connect to the remote server?"
-    echo -e "  ${DIM}(Required if outbound connections are restricted on this server)${NC}"
-    echo ""
-    echo "    1) Yes — I have a SOCKS5 proxy"
-    echo "    2) No  — connect directly"
-    echo ""
-    read -rp "  Choice [1/2, default 2]: " PROXY_CHOICE
-    PROXY_CHOICE=${PROXY_CHOICE:-2}
+restart_sshd() {
+    local svc=""
+    for name in ssh sshd openssh-server; do
+        if systemctl list-units --full --all 2>/dev/null | grep -q "^${name}\.service"; then
+            svc="$name"
+            break
+        fi
+    done
 
-    PROXY_CMD=""
-    PROXY_ADDR=""
-    APT_PROXY_ARGS=""
+    if [[ -n "$svc" ]]; then
+        systemctl restart "$svc" && ok "sshd restarted (service: $svc)" && return 0
+    else
+        systemctl restart ssh  2>/dev/null && ok "sshd restarted (ssh)"  && return 0
+        systemctl restart sshd 2>/dev/null && ok "sshd restarted (sshd)" && return 0
+    fi
 
-    if [[ "$PROXY_CHOICE" == "1" ]]; then
+    err "Could not restart sshd — do it manually: systemctl restart ssh"
+    return 1
+}
+
+# ─────────────────────────────────────────────────────
+#  Fix GatewayPorts across ALL sshd config files
+# ─────────────────────────────────────────────────────
+
+fix_gateway_ports() {
+    local SSHD="/etc/ssh/sshd_config"
+
+    step "Scanning all /etc/ssh/ files for GatewayPorts..."
+
+    # Remove every occurrence (commented or not) from every file under /etc/ssh/
+    while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        sed -i "/^[[:space:]]*#*[[:space:]]*GatewayPorts\b/Id" "$f"
+        ok "  Cleaned: $f"
+    done < <(grep -rli "GatewayPorts" /etc/ssh/ 2>/dev/null)
+
+    # Write GatewayPorts clientspecified at the very TOP of sshd_config
+    # (before any Include lines, so it wins)
+    local tmp
+    tmp=$(mktemp)
+    echo "GatewayPorts clientspecified" > "$tmp"
+    cat "$SSHD" >> "$tmp"
+    mv "$tmp" "$SSHD"
+    ok "GatewayPorts clientspecified written at top of $SSHD"
+
+    restart_sshd
+    sleep 1
+
+    # Hard verify using runtime effective config
+    local gp
+    gp=$(sshd -T 2>/dev/null | awk '/^gatewayports/{print $2}')
+    if [[ "$gp" == "clientspecified" || "$gp" == "yes" ]]; then
+        ok "Verified runtime GatewayPorts=${gp}"
+        return 0
+    else
+        err "GatewayPorts is '${gp}' — automatic fix failed!"
         echo ""
-        read -rp "  SOCKS5 proxy address (e.g. 127.0.0.1:1080): " PROXY_ADDR
-        [[ -z "$PROXY_ADDR" ]] && { err "Proxy address required"; exit 1; }
-
-        local proxy_host proxy_port
-        proxy_host="${PROXY_ADDR%:*}"
-        proxy_port="${PROXY_ADDR##*:}"
-        [[ -z "$proxy_host" || -z "$proxy_port" ]] && { err "Format must be host:port"; exit 1; }
-
-        PROXY_CMD="ProxyCommand=nc -x ${proxy_host}:${proxy_port} -X 5 %h %p"
-        # For apt/curl installs via proxy
-        APT_PROXY_ARGS="-o Acquire::http::proxy=\"socks5h://${PROXY_ADDR}\" -o Acquire::https::proxy=\"socks5h://${PROXY_ADDR}\""
-        ok "SOCKS5 proxy set: $PROXY_ADDR"
+        warn "Fix manually on the VPS:"
+        info "  grep -ri gatewayports /etc/ssh/"
+        info "  Remove any 'GatewayPorts no' lines"
+        info "  Add: GatewayPorts clientspecified"
+        info "  systemctl restart ssh"
+        echo ""
+        return 1
     fi
 }
 
 # ─────────────────────────────────────────────────────
-#  Install dependencies (proxy-aware)
+#  Check if a port is bound on 0.0.0.0 (not 127.0.0.1)
+#  Uses /proc/net/tcp + tcp6 — no ss/netstat needed
 # ─────────────────────────────────────────────────────
 
-install_deps() {
-    step "Checking dependencies..."
-    local pkgs=()
-    command -v nc      &>/dev/null || pkgs+=(netcat-openbsd)
-    command -v sshpass &>/dev/null || pkgs+=(sshpass)
+port_on_all_interfaces() {
+    local port="$1"
+    local hex_port
+    hex_port=$(printf '%04X' "$port")
 
-    if [[ ${#pkgs[@]} -gt 0 ]]; then
-        step "Installing: ${pkgs[*]}"
-        if command -v apt-get &>/dev/null; then
-            if [[ -n "$APT_PROXY_ARGS" ]]; then
-                step "Using SOCKS5 proxy for apt..."
-                eval apt-get install -y "${pkgs[@]}" -q $APT_PROXY_ARGS 2>/dev/null
-            else
-                apt-get install -y "${pkgs[@]}" -q 2>/dev/null
-            fi
-        elif command -v yum &>/dev/null; then
-            if [[ -n "$PROXY_ADDR" ]]; then
-                http_proxy="socks5h://${PROXY_ADDR}" yum install -y "${pkgs[@]}" -q 2>/dev/null
-            else
-                yum install -y "${pkgs[@]}" -q 2>/dev/null
-            fi
-        else
-            warn "Could not auto-install: ${pkgs[*]} — please install manually"
-            return
-        fi
-
-        # Verify
-        local failed=()
-        for pkg in "${pkgs[@]}"; do
-            local bin="${pkg%%-*}"  # e.g. netcat-openbsd -> netcat, sshpass -> sshpass
-            command -v "$bin" &>/dev/null || command -v nc &>/dev/null || failed+=("$pkg")
-        done
-        [[ ${#failed[@]} -gt 0 ]] && warn "Could not install: ${failed[*]} — install manually if needed"
+    # /proc/net/tcp — IPv4
+    # 00000000:PPPP = 0.0.0.0 (all interfaces) = good
+    if [[ -r /proc/net/tcp ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*sl ]] && continue
+            local la; la=$(echo "$line" | awk '{print $2}')
+            [[ "${la##*:}" == "$hex_port" ]] || continue
+            [[ "${la%:*}" == "00000000" ]] && return 0
+        done < /proc/net/tcp
     fi
-    ok "Dependencies OK"
+
+    # /proc/net/tcp6 — IPv6
+    # 00000000000000000000000000000000 = :: (all interfaces) = good
+    if [[ -r /proc/net/tcp6 ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*sl ]] && continue
+            local la; la=$(echo "$line" | awk '{print $2}')
+            [[ "${la##*:}" == "$hex_port" ]] || continue
+            [[ "${la%:*}" == "00000000000000000000000000000000" ]] && return 0
+        done < /proc/net/tcp6
+    fi
+
+    return 1
+}
+
+# Returns the current bind address of a port (human readable)
+port_bind_addr() {
+    local port="$1"
+    local hex_port
+    hex_port=$(printf '%04X' "$port")
+
+    if [[ -r /proc/net/tcp ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*sl ]] && continue
+            local la; la=$(echo "$line" | awk '{print $2}')
+            [[ "${la##*:}" == "$hex_port" ]] || continue
+            local addr="${la%:*}"
+            case "$addr" in
+                00000000) echo "0.0.0.0"; return ;;
+                0100007F) echo "127.0.0.1"; return ;;
+                *)        echo "$addr"; return ;;
+            esac
+        done < /proc/net/tcp
+    fi
+
+    echo "not listening"
 }
 
 # ─────────────────────────────────────────────────────
@@ -136,54 +187,23 @@ setup_server() {
     echo -e "${BOLD}  ► Server Setup  (VPS / Kharej)${NC}"
     hr
 
-    step "Configuring sshd..."
+    # Fix GatewayPorts everywhere
+    fix_gateway_ports
+    local gp_ok=$?
+
+    # Other sshd settings
     local SSHD="/etc/ssh/sshd_config"
-
-    # ── Remove GatewayPorts from EVERY file under /etc/ssh/ ─────────────
-    step "Scanning all files under /etc/ssh/ for GatewayPorts..."
-
-    while IFS= read -r f; do
-        [[ -f "$f" ]] || continue
-        sed -i "/^[[:space:]]*#*[[:space:]]*GatewayPorts\b/Id" "$f"
-        ok "  Cleaned: $f"
-    done < <(grep -rli "GatewayPorts" /etc/ssh/ 2>/dev/null)
-
-    # Write our value at the TOP of main config (wins over any Include below it)
-    local tmp_sshd
-    tmp_sshd=$(mktemp)
-    echo "GatewayPorts clientspecified" > "$tmp_sshd"
-    cat "$SSHD" >> "$tmp_sshd"
-    mv "$tmp_sshd" "$SSHD"
-    ok "GatewayPorts clientspecified written at top of $SSHD"
-
-    # ── Other required settings ───────────────────────────────────────────
-    set_sshd() {
-        local key="$1" val="$2"
-        sed -i "/^#*\s*${key}\b/Id" "$SSHD"
-        echo "${key} ${val}" >> "$SSHD"
+    set_sshd_kv() {
+        sed -i "/^[[:space:]]*#*[[:space:]]*${1}\b/Id" "$SSHD"
+        echo "${1} ${2}" >> "$SSHD"
     }
-    set_sshd "AllowTcpForwarding"  "yes"
-    set_sshd "ClientAliveInterval" "30"
-    set_sshd "ClientAliveCountMax" "6"
-
-    systemctl restart sshd && ok "sshd restarted"
-
-    # ── Hard verify via sshd -T (runtime effective config) ───────────────
-    sleep 1
-    local gp_val
-    gp_val=$(sshd -T 2>/dev/null | grep -i "^gatewayports" | awk '{print $2}')
-    if [[ "$gp_val" == "clientspecified" || "$gp_val" == "yes" ]]; then
-        ok "Verified effective GatewayPorts=${gp_val}"
-    else
-        err "GatewayPorts is still '${gp_val}' after all fixes!"
-        warn "Manual check:"
-        info "  sshd -T | grep gatewayports"
-        info "  grep -ri gatewayports /etc/ssh/"
-        read -rp "  Fix manually then press Enter to continue, or Ctrl+C to abort: "
-    fi
+    set_sshd_kv "AllowTcpForwarding"  "yes"
+    set_sshd_kv "ClientAliveInterval" "30"
+    set_sshd_kv "ClientAliveCountMax" "6"
+    restart_sshd
 
     echo ""
-    echo -e "  How many tunnel ports do you want to open? ${DIM}(1–20, default 1)${NC}"
+    echo -e "  How many tunnel ports? ${DIM}(1–20, default 1)${NC}"
     read -rp "  Count: " PORT_COUNT
     PORT_COUNT=${PORT_COUNT:-1}
     [[ ! "$PORT_COUNT" =~ ^[0-9]+$ || "$PORT_COUNT" -lt 1 || "$PORT_COUNT" -gt 20 ]] \
@@ -207,71 +227,161 @@ setup_server() {
             firewall-cmd --permanent --add-port="${p}/tcp" &>/dev/null
             firewall-cmd --reload &>/dev/null && ok "firewalld: port $p/tcp opened"
         else
-            iptables -A INPUT -p tcp --dport "$p" -j ACCEPT && ok "iptables: port $p/tcp opened"
+            iptables -A INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null \
+                && ok "iptables: port $p/tcp opened"
         fi
     done
 
     hr
     ok "Server ready! Tunnel ports: ${PORTS[*]}"
     echo ""
+
+    if [[ $gp_ok -ne 0 ]]; then
+        warn "GatewayPorts could not be set automatically."
+        warn "Tunnels will bind on 127.0.0.1 instead of 0.0.0.0 until you fix it:"
+        info "  1. grep -ri gatewayports /etc/ssh/"
+        info "  2. Remove any 'GatewayPorts no' lines from all files shown"
+        info "  3. Add 'GatewayPorts clientspecified' to /etc/ssh/sshd_config"
+        info "  4. systemctl restart ssh"
+        echo ""
+    fi
+
     info "Now run setup.sh on the Iran server and choose 'Client Setup'."
     echo ""
 
-    # Wait for Iran to connect — watch for tunnel ports to bind on 0.0.0.0
+    # ── Wait for Iran to connect — poll /proc/net/tcp for 0.0.0.0 bind ──
     echo -e "  ${BOLD}Waiting for Iran client to connect...${NC}"
-    echo -e "  ${DIM}(watching for tunnel ports to appear on 0.0.0.0 — Ctrl+C to skip)${NC}"
+    echo -e "  ${DIM}(Ctrl+C to skip)${NC}"
     echo ""
 
-    local all_up=0
-    local max_wait=300   # 5 minutes
+    local max_wait=300
     local elapsed=0
+    local all_up=0
 
     while [[ $elapsed -lt $max_wait ]]; do
         all_up=1
         for p in "${PORTS[@]}"; do
-            # Port is ready when it binds on 0.0.0.0 (not just 127.0.0.1)
-            if ! ss -tlnp 2>/dev/null | grep -q "0\.0\.0\.0:${p}"; then
-                all_up=0
-                break
-            fi
+            port_on_all_interfaces "$p" || { all_up=0; break; }
         done
 
         if [[ $all_up -eq 1 ]]; then
             echo ""
             ok "All tunnel ports are up on 0.0.0.0!"
             for p in "${PORTS[@]}"; do
-                ok "  Port ${p} → 0.0.0.0:${p} ✓"
+                ok "  0.0.0.0:${p} ✓"
             done
             echo ""
             break
         fi
 
-        # Show per-port status on one line (no color codes inside printf)
-        local status_line=""
+        local status_line="  [${elapsed}s]"
         for p in "${PORTS[@]}"; do
-            if ss -tlnp 2>/dev/null | grep -q "0\.0\.0\.0:${p}"; then
-                status_line+=" ${p}[UP]"
-            else
-                status_line+=" ${p}[wait]"
-            fi
+            port_on_all_interfaces "$p" \
+                && status_line+=" ${p}[UP]" \
+                || status_line+=" ${p}[wait]"
         done
-        printf "\r  [%3ds]%s   " "$elapsed" "$status_line"
+        printf "\r%-70s" "$status_line"
 
         sleep 2
         (( elapsed += 2 ))
     done
 
+    # ── Timeout: show exactly what's wrong ───────────────────────────────
     if [[ $all_up -eq 0 ]]; then
         echo ""
-        warn "Timeout — Iran client did not connect within ${max_wait}s"
-        warn "Check that:"
-        info "  1. Iran server ran Client Setup and service is running"
-        info "  2. Firewall allows ports: ${PORTS[*]}"
-        info "  3. GatewayPorts=yes is active: sshd -T | grep gatewayports"
+        echo ""
+        warn "Iran client did not connect within ${max_wait}s"
+        echo ""
+        for p in "${PORTS[@]}"; do
+            local bound
+            bound=$(port_bind_addr "$p")
+            case "$bound" in
+                "0.0.0.0")
+                    ok "Port $p: bound to 0.0.0.0 ✓"
+                    ;;
+                "127.0.0.1")
+                    err "Port $p: bound to 127.0.0.1 only — GatewayPorts not working"
+                    warn "  Fix on VPS:"
+                    info "    grep -ri gatewayports /etc/ssh/"
+                    info "    Ensure: GatewayPorts clientspecified"
+                    info "    Then:   systemctl restart ssh"
+                    info "    Then on Iran: systemctl restart ssh-tunnel"
+                    ;;
+                "not listening")
+                    warn "Port $p: nothing listening — Iran client not connected yet"
+                    ;;
+                *)
+                    warn "Port $p: bound to unknown addr (${bound})"
+                    ;;
+            esac
+        done
     fi
 
     echo ""
     read -rp "  [Press Enter to return to menu]"
+}
+
+# ─────────────────────────────────────────────────────
+#  SOCKS5 proxy
+# ─────────────────────────────────────────────────────
+
+ask_proxy() {
+    echo ""
+    echo -e "  ${BOLD}Proxy Configuration${NC}"
+    echo -e "  Do you have a SOCKS5 proxy to reach the VPS?"
+    echo -e "  ${DIM}(Required if outbound is restricted on this server)${NC}"
+    echo ""
+    echo "    1) Yes — I have a SOCKS5 proxy"
+    echo "    2) No  — connect directly"
+    echo ""
+    read -rp "  Choice [1/2, default 2]: " PROXY_CHOICE
+    PROXY_CHOICE=${PROXY_CHOICE:-2}
+
+    PROXY_CMD=""
+    PROXY_ADDR=""
+    APT_PROXY_ARGS=""
+
+    if [[ "$PROXY_CHOICE" == "1" ]]; then
+        echo ""
+        read -rp "  SOCKS5 address (e.g. 127.0.0.1:1080): " PROXY_ADDR
+        [[ -z "$PROXY_ADDR" ]] && { err "Proxy address required"; exit 1; }
+        local ph="${PROXY_ADDR%:*}" pp="${PROXY_ADDR##*:}"
+        [[ -z "$ph" || -z "$pp" ]] && { err "Format: host:port"; exit 1; }
+        PROXY_CMD="ProxyCommand=nc -x ${ph}:${pp} -X 5 %h %p"
+        APT_PROXY_ARGS="-o Acquire::http::proxy=\"socks5h://${PROXY_ADDR}\" -o Acquire::https::proxy=\"socks5h://${PROXY_ADDR}\""
+        ok "SOCKS5 proxy: $PROXY_ADDR"
+    fi
+}
+
+# ─────────────────────────────────────────────────────
+#  Install deps (proxy-aware)
+# ─────────────────────────────────────────────────────
+
+install_deps() {
+    step "Checking dependencies..."
+    local pkgs=()
+    command -v nc      &>/dev/null || pkgs+=(netcat-openbsd)
+    command -v sshpass &>/dev/null || pkgs+=(sshpass)
+
+    if [[ ${#pkgs[@]} -gt 0 ]]; then
+        step "Installing: ${pkgs[*]}"
+        if command -v apt-get &>/dev/null; then
+            if [[ -n "$APT_PROXY_ARGS" ]]; then
+                eval apt-get install -y "${pkgs[@]}" -q "$APT_PROXY_ARGS" 2>/dev/null
+            else
+                apt-get install -y "${pkgs[@]}" -q 2>/dev/null
+            fi
+        elif command -v yum &>/dev/null; then
+            if [[ -n "$PROXY_ADDR" ]]; then
+                http_proxy="socks5h://${PROXY_ADDR}" yum install -y "${pkgs[@]}" -q 2>/dev/null
+            else
+                yum install -y "${pkgs[@]}" -q 2>/dev/null
+            fi
+        else
+            warn "Cannot auto-install ${pkgs[*]} — install manually"
+        fi
+    fi
+    ok "Dependencies OK"
 }
 
 # ─────────────────────────────────────────────────────
@@ -281,135 +391,88 @@ setup_server() {
 ask_auth() {
     echo ""
     echo -e "  ${BOLD}Authentication${NC}"
-    echo -e "  How do you want to authenticate to the remote server?"
     echo ""
-    echo "    1) Password  — script will copy the SSH key automatically"
-    echo "    2) Key-based — SSH key already installed on remote server"
+    echo "    1) Password  — script copies SSH key automatically"
+    echo "    2) Key-based — key already on remote server"
     echo ""
     read -rp "  Choice [1/2, default 1]: " AUTH_CHOICE
     AUTH_CHOICE=${AUTH_CHOICE:-1}
 
     REMOTE_PASS=""
     if [[ "$AUTH_CHOICE" == "1" ]]; then
-        echo ""
         read -rsp "  SSH password for remote server: " REMOTE_PASS
         echo ""
         [[ -z "$REMOTE_PASS" ]] && { err "Password required"; exit 1; }
         ok "Password received"
     else
-        ok "Key-based mode — no password needed"
+        ok "Key-based — no password needed"
     fi
-}
-
-build_tunnel_entry() {
-    local REMOTE_USER="$1"
-    local REMOTE_HOST="$2"
-    local SSH_PORT="$3"
-    local TUNNEL_PORT="$4"
-    local LOCAL_PORT="$5"
-    local PROXY_CMD="$6"
-
-    local ID="${REMOTE_HOST}:${TUNNEL_PORT}"
-    echo "${ID}|${REMOTE_USER}|${REMOTE_HOST}|${SSH_PORT}|${TUNNEL_PORT}|${LOCAL_PORT}|${PROXY_CMD}"
 }
 
 copy_ssh_key() {
-    local REMOTE_USER="$1"
-    local REMOTE_HOST="$2"
-    local SSH_PORT="$3"
-    local PROXY_CMD="$4"
-    local REMOTE_PASS="$5"
+    local REMOTE_USER="$1" REMOTE_HOST="$2" SSH_PORT="$3"
+    local PROXY_CMD="$4" REMOTE_PASS="$5"
 
-    if [[ ! -f ~/.ssh/id_rsa ]]; then
+    [[ ! -f ~/.ssh/id_rsa ]] && {
         step "Generating SSH key..."
         ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa -q
-        ok "SSH key created: ~/.ssh/id_rsa"
-    else
-        ok "SSH key found: ~/.ssh/id_rsa"
-    fi
+        ok "SSH key created"
+    } || ok "SSH key found: ~/.ssh/id_rsa"
 
-    # Make sure sshpass is installed
     if [[ -n "$REMOTE_PASS" ]] && ! command -v sshpass &>/dev/null; then
-        step "sshpass not found — attempting to install..."
+        step "Installing sshpass..."
         install_deps
         if ! command -v sshpass &>/dev/null; then
-            err "sshpass could not be installed."
-            echo ""
-            warn "Please add this public key manually to the remote server's ~/.ssh/authorized_keys:"
-            echo ""
+            err "sshpass not available — add key manually:"
             echo -e "  ${YELLOW}$(cat ~/.ssh/id_rsa.pub)${NC}"
-            echo ""
-            read -rp "  Press Enter after adding the key, or Ctrl+C to cancel: "
+            read -rp "  Press Enter after adding the key: "
             return
         fi
     fi
 
-    step "Copying SSH key to remote server..."
-    local COPY_ARGS=()
-    [[ -n "$PROXY_CMD" ]] && COPY_ARGS+=(-o "$PROXY_CMD")
-    COPY_ARGS+=(-o "StrictHostKeyChecking=no" -p "$SSH_PORT")
+    step "Copying SSH key to remote..."
+    local args=()
+    [[ -n "$PROXY_CMD" ]] && args+=(-o "$PROXY_CMD")
+    args+=(-o "StrictHostKeyChecking=no" -p "$SSH_PORT")
 
     if [[ -n "$REMOTE_PASS" ]]; then
-        SSHPASS="$REMOTE_PASS" sshpass -e ssh-copy-id "${COPY_ARGS[@]}" "${REMOTE_USER}@${REMOTE_HOST}"
+        SSHPASS="$REMOTE_PASS" sshpass -e ssh-copy-id "${args[@]}" "${REMOTE_USER}@${REMOTE_HOST}"
     else
-        ssh-copy-id "${COPY_ARGS[@]}" "${REMOTE_USER}@${REMOTE_HOST}"
+        ssh-copy-id "${args[@]}" "${REMOTE_USER}@${REMOTE_HOST}"
     fi
 
     if [[ $? -eq 0 ]]; then
         ok "SSH key installed — passwordless login active"
     else
-        warn "ssh-copy-id failed — add this key manually to remote authorized_keys:"
-        echo ""
+        warn "ssh-copy-id failed — add key manually:"
         echo -e "  ${YELLOW}$(cat ~/.ssh/id_rsa.pub)${NC}"
-        echo ""
-        read -rp "  Press Enter after adding the key, or Ctrl+C to cancel: "
+        read -rp "  Press Enter after adding the key: "
     fi
 }
 
 wait_for_connection() {
-    local REMOTE_HOST="$1"
-    local SSH_PORT="$2"
-    local PROXY_CMD="$3"
-    local REMOTE_USER="$4"
-    local MAX_WAIT=60
-    local elapsed=0
+    local REMOTE_HOST="$1" SSH_PORT="$2" PROXY_CMD="$3" REMOTE_USER="$4"
+    local max=60 elapsed=0
 
-    step "Testing connection to ${REMOTE_HOST}:${SSH_PORT}..."
-    echo -e "  ${DIM}(timeout ${MAX_WAIT}s)${NC}"
-
-    while [[ $elapsed -lt $MAX_WAIT ]]; do
-        local ssh_test_args=()
-        [[ -n "$PROXY_CMD" ]] && ssh_test_args+=(-o "$PROXY_CMD")
-        ssh_test_args+=(
-            -o "StrictHostKeyChecking=no"
-            -o "ConnectTimeout=5"
-            -o "BatchMode=yes"
-            -p "$SSH_PORT"
-        )
-
-        ssh "${ssh_test_args[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "exit" 2>/dev/null
-        if [[ $? -eq 0 ]]; then
-            echo ""
-            ok "Connection established to ${REMOTE_HOST}!"
-            return 0
-        fi
-
-        printf "  Attempt %d/%d...  \r" "$((elapsed+1))" "$MAX_WAIT"
-        sleep 1
-        (( elapsed++ ))
+    step "Testing SSH connection to ${REMOTE_HOST}:${SSH_PORT}..."
+    while [[ $elapsed -lt $max ]]; do
+        local args=()
+        [[ -n "$PROXY_CMD" ]] && args+=(-o "$PROXY_CMD")
+        args+=(-o "StrictHostKeyChecking=no" -o "ConnectTimeout=5" -o "BatchMode=yes" -p "$SSH_PORT")
+        ssh "${args[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "exit" 2>/dev/null && {
+            echo ""; ok "Connected to ${REMOTE_HOST}!"; return 0
+        }
+        printf "\r  Attempt %d/%d..." "$((elapsed+1))" "$max"
+        sleep 1; (( elapsed++ ))
     done
-
-    echo ""
-    err "Could not connect to ${REMOTE_HOST}:${SSH_PORT} within ${MAX_WAIT}s"
-    return 1
+    echo ""; err "Cannot connect to ${REMOTE_HOST}:${SSH_PORT}"; return 1
 }
 
 generate_tunnel_script() {
     step "Generating tunnel runner script..."
-
     cat > "$TUNNEL_SCRIPT" << 'SCRIPT_EOF'
 #!/bin/bash
-# Auto-generated by SSH Tunnel Manager v2.2
+# Auto-generated by SSH Tunnel Manager v2.3
 CONFIG_DIR="/etc/ssh-tunnel"
 TUNNELS_FILE="$CONFIG_DIR/tunnels.conf"
 LOG_FILE="$CONFIG_DIR/tunnel.log"
@@ -417,9 +480,7 @@ LOG_FILE="$CONFIG_DIR/tunnel.log"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "$LOG_FILE"; }
 
 run_tunnel() {
-    local LINE="$1"
-    IFS='|' read -r ID REMOTE_USER REMOTE_HOST SSH_PORT TUNNEL_PORT LOCAL_PORT PROXY_CMD <<< "$LINE"
-
+    IFS='|' read -r ID REMOTE_USER REMOTE_HOST SSH_PORT TUNNEL_PORT LOCAL_PORT PROXY_CMD <<< "$1"
     local SSH_OPTS=(
         -N
         -o "ServerAliveInterval=30"
@@ -431,13 +492,11 @@ run_tunnel() {
         -p "$SSH_PORT"
         -R "0.0.0.0:${TUNNEL_PORT}:127.0.0.1:${LOCAL_PORT}"
     )
-
     [[ -n "$PROXY_CMD" ]] && SSH_OPTS+=(-o "$PROXY_CMD")
-
     while true; do
-        log "[TUNNEL $ID] Connecting to ${REMOTE_USER}@${REMOTE_HOST}..."
+        log "[TUNNEL $ID] Connecting..."
         ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}"
-        log "[TUNNEL $ID] Disconnected. Retrying in 5s..."
+        log "[TUNNEL $ID] Disconnected. Retry in 5s..."
         sleep 5
     done
 }
@@ -450,7 +509,6 @@ done < "$TUNNELS_FILE"
 log "All tunnels launched."
 wait
 SCRIPT_EOF
-
     chmod +x "$TUNNEL_SCRIPT"
     ok "Tunnel runner: $TUNNEL_SCRIPT"
 }
@@ -474,76 +532,59 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 SVC_EOF
-
     systemctl daemon-reload
     systemctl enable ssh-tunnel &>/dev/null
-    ok "Service installed and enabled (ssh-tunnel)"
+    ok "Service installed and enabled"
 }
 
 setup_client() {
     banner
     echo -e "${BOLD}  ► Client Setup  (Iran / restricted server)${NC}"
     hr
-
     ensure_config_dir
 
-    # Step 1: proxy first (needed for installs too)
     ask_proxy
-
-    # Step 2: install deps using proxy if set
     install_deps
 
-    # Step 3: remote server info
     echo ""
-    echo -e "  ${BOLD}Remote Server (VPS / Kharej)${NC}"
+    echo -e "  ${BOLD}Remote VPS${NC}"
     read -rp "  SSH host (IP or domain): " REMOTE_HOST
     [[ -z "$REMOTE_HOST" ]] && { err "Host required"; exit 1; }
-
     read -rp "  SSH user [default root]: " REMOTE_USER
     REMOTE_USER=${REMOTE_USER:-root}
-
     read -rp "  SSH port [default 22]: " SSH_PORT
     SSH_PORT=${SSH_PORT:-22}
 
-    # Step 4: auth
     ask_auth
 
-    # Step 5: tunnel ports
     echo ""
-    echo -e "  ${BOLD}Tunnel Configuration${NC}"
-    echo -e "  How many tunnels do you want to create? ${DIM}(1–20, default 1)${NC}"
+    echo -e "  ${BOLD}Tunnel Ports${NC}"
+    echo -e "  How many tunnels? ${DIM}(1–20, default 1)${NC}"
     read -rp "  Count: " TUNNEL_COUNT
     TUNNEL_COUNT=${TUNNEL_COUNT:-1}
     [[ ! "$TUNNEL_COUNT" =~ ^[0-9]+$ || "$TUNNEL_COUNT" -lt 1 || "$TUNNEL_COUNT" -gt 20 ]] \
-        && { err "Invalid number"; exit 1; }
+        && { err "Invalid"; exit 1; }
 
     local ENTRIES=()
     for (( i=1; i<=TUNNEL_COUNT; i++ )); do
         echo ""
         echo -e "  ${CYAN}── Tunnel #${i} ──${NC}"
-        local default_t=$(( 20000 + i - 1 ))
-        read -rp "  Remote tunnel port on VPS [default ${default_t}]: " TUNNEL_PORT
-        TUNNEL_PORT=${TUNNEL_PORT:-$default_t}
-
+        local def=$(( 20000 + i - 1 ))
+        read -rp "  Remote port on VPS [default ${def}]: " TUNNEL_PORT
+        TUNNEL_PORT=${TUNNEL_PORT:-$def}
         read -rp "  Local port to forward [default ${TUNNEL_PORT}]: " LOCAL_PORT
         LOCAL_PORT=${LOCAL_PORT:-$TUNNEL_PORT}
-
-        ENTRIES+=("$(build_tunnel_entry "$REMOTE_USER" "$REMOTE_HOST" "$SSH_PORT" "$TUNNEL_PORT" "$LOCAL_PORT" "$PROXY_CMD")")
+        ENTRIES+=("${REMOTE_HOST}:${TUNNEL_PORT}|${REMOTE_USER}|${REMOTE_HOST}|${SSH_PORT}|${TUNNEL_PORT}|${LOCAL_PORT}|${PROXY_CMD}")
         ok "Tunnel #${i}: local:${LOCAL_PORT} → ${REMOTE_HOST}:${TUNNEL_PORT}"
     done
 
-    # Step 6: copy SSH key
     copy_ssh_key "$REMOTE_USER" "$REMOTE_HOST" "$SSH_PORT" "$PROXY_CMD" "$REMOTE_PASS"
 
-    # Step 7: test connection
-    wait_for_connection "$REMOTE_HOST" "$SSH_PORT" "$PROXY_CMD" "$REMOTE_USER"
-    if [[ $? -ne 0 ]]; then
-        err "Connection failed — setup aborted"
-        exit 1
-    fi
+    wait_for_connection "$REMOTE_HOST" "$SSH_PORT" "$PROXY_CMD" "$REMOTE_USER" || {
+        err "Connection failed — aborting"; exit 1
+    }
 
-    # Step 8: save and start
-    step "Saving tunnel config..."
+    step "Saving config..."
     for entry in "${ENTRIES[@]}"; do
         echo "$entry" >> "$TUNNELS_FILE"
     done
@@ -551,21 +592,18 @@ setup_client() {
 
     generate_tunnel_script
     generate_service
-
     systemctl restart ssh-tunnel
     sleep 2
 
     hr
     if systemctl is-active ssh-tunnel &>/dev/null; then
-        echo ""
         echo -e "${GREEN}${BOLD}  ✓ Setup complete! ${TUNNEL_COUNT} tunnel(s) active.${NC}"
     else
-        echo ""
-        warn "Service may have issues — run: journalctl -u ssh-tunnel -f"
+        warn "Service may have issues — check: journalctl -u ssh-tunnel -f"
     fi
     echo ""
-    info "Status:  systemctl status ssh-tunnel"
-    info "Logs:    journalctl -u ssh-tunnel -f"
+    info "Status: systemctl status ssh-tunnel"
+    info "Logs:   journalctl -u ssh-tunnel -f"
     echo ""
     read -rp "  [Press Enter to return to menu]"
 }
@@ -577,144 +615,94 @@ setup_client() {
 list_tunnels() {
     echo ""
     if [[ ! -s "$TUNNELS_FILE" ]]; then
-        warn "No tunnels configured."
-        return 1
+        warn "No tunnels configured."; return 1
     fi
-
     local i=1
     echo -e "  ${BOLD}Configured Tunnels:${NC}"
     hr
     printf "  %-4s %-22s %-10s %-13s %-12s %-10s %s\n" \
         "#" "Remote Host" "SSH Port" "Tunnel Port" "Local Port" "Proxy" "Status"
     hr
-
-    while IFS='|' read -r ID REMOTE_USER REMOTE_HOST SSH_PORT TUNNEL_PORT LOCAL_PORT PROXY_CMD; do
+    while IFS='|' read -r ID RU RH SP TP LP PC; do
         [[ -z "$ID" || "$ID" == \#* ]] && continue
-        local proxy_label="none"
-        [[ -n "$PROXY_CMD" ]] && proxy_label="socks5"
-
-        local status_str
-        if systemctl is-active ssh-tunnel &>/dev/null; then
-            status_str="${GREEN}active${NC}"
-        else
-            status_str="${RED}stopped${NC}"
-        fi
-
-        printf "  %-4s %-22s %-10s %-13s %-12s %-10s " \
-            "$i" "$REMOTE_HOST" "$SSH_PORT" "$TUNNEL_PORT" "$LOCAL_PORT" "$proxy_label"
-        echo -e "${status_str}"
+        local proxy_label="none"; [[ -n "$PC" ]] && proxy_label="socks5"
+        local st
+        systemctl is-active ssh-tunnel &>/dev/null \
+            && st="${GREEN}active${NC}" || st="${RED}stopped${NC}"
+        printf "  %-4s %-22s %-10s %-13s %-12s %-10s " "$i" "$RH" "$SP" "$TP" "$LP" "$proxy_label"
+        echo -e "$st"
         (( i++ ))
     done < "$TUNNELS_FILE"
     echo ""
-    return 0
 }
 
 delete_tunnel() {
     list_tunnels || return
-    read -rp "  Tunnel number to delete (0 = cancel): " DEL_NUM
-    [[ "$DEL_NUM" == "0" || -z "$DEL_NUM" ]] && return
-
-    local i=1 NEW_CONF=""
+    read -rp "  Tunnel number to delete (0 = cancel): " N
+    [[ "$N" == "0" || -z "$N" ]] && return
+    local i=1 NEW=""
     while IFS= read -r line; do
         [[ -z "$line" || "$line" == \#* ]] && continue
-        if [[ "$i" -ne "$DEL_NUM" ]]; then
-            NEW_CONF+="${line}\n"
-        else
-            ok "Tunnel #${DEL_NUM} removed"
-        fi
+        [[ "$i" -ne "$N" ]] && NEW+="${line}\n" || ok "Tunnel #${N} removed"
         (( i++ ))
     done < "$TUNNELS_FILE"
-
-    printf "%b" "$NEW_CONF" > "$TUNNELS_FILE"
+    printf "%b" "$NEW" > "$TUNNELS_FILE"
     generate_tunnel_script
     systemctl restart ssh-tunnel && ok "Service restarted"
 }
 
 edit_tunnel() {
     list_tunnels || return
-    read -rp "  Tunnel number to edit (0 = cancel): " EDIT_NUM
-    [[ "$EDIT_NUM" == "0" || -z "$EDIT_NUM" ]] && return
-
-    local i=1 FOUND=0 NEW_CONF=""
-
-    while IFS='|' read -r ID REMOTE_USER REMOTE_HOST SSH_PORT TUNNEL_PORT LOCAL_PORT PROXY_CMD; do
+    read -rp "  Tunnel number to edit (0 = cancel): " N
+    [[ "$N" == "0" || -z "$N" ]] && return
+    local i=1 FOUND=0 NEW=""
+    while IFS='|' read -r ID RU RH SP TP LP PC; do
         [[ -z "$ID" || "$ID" == \#* ]] && continue
-        if [[ "$i" -eq "$EDIT_NUM" ]]; then
+        if [[ "$i" -eq "$N" ]]; then
             FOUND=1
             echo ""
-            echo -e "  ${BOLD}Edit Tunnel #${EDIT_NUM}${NC}  (Enter = keep current value)"
-            echo ""
-
-            read -rp "  Remote host  [${REMOTE_HOST}]: "  NEW_HOST;     NEW_HOST=${NEW_HOST:-$REMOTE_HOST}
-            read -rp "  SSH user     [${REMOTE_USER}]: "  NEW_USER;     NEW_USER=${NEW_USER:-$REMOTE_USER}
-            read -rp "  SSH port     [${SSH_PORT}]: "     NEW_SSH_PORT; NEW_SSH_PORT=${NEW_SSH_PORT:-$SSH_PORT}
-            read -rp "  Tunnel port  [${TUNNEL_PORT}]: "  NEW_TP;       NEW_TP=${NEW_TP:-$TUNNEL_PORT}
-            read -rp "  Local port   [${LOCAL_PORT}]: "   NEW_LP;       NEW_LP=${NEW_LP:-$LOCAL_PORT}
-
-            echo ""
-            local cur_proxy="none"
-            [[ -n "$PROXY_CMD" ]] && cur_proxy="$PROXY_CMD"
-            echo -e "  Current proxy: ${DIM}${cur_proxy}${NC}"
-            read -rp "  New SOCKS5 proxy (host:port), 'none' to clear, Enter to keep: " NEW_PROXY_RAW
-            local NEW_PROXY_CMD="$PROXY_CMD"
-            if [[ "$NEW_PROXY_RAW" == "none" ]]; then
-                NEW_PROXY_CMD=""
-            elif [[ -n "$NEW_PROXY_RAW" ]]; then
-                local ph="${NEW_PROXY_RAW%:*}"
-                local pp="${NEW_PROXY_RAW##*:}"
-                NEW_PROXY_CMD="ProxyCommand=nc -x ${ph}:${pp} -X 5 %h %p"
+            echo -e "  ${BOLD}Edit Tunnel #${N}${NC}  (Enter = keep current)"
+            read -rp "  Remote host  [${RH}]: " v; RH=${v:-$RH}
+            read -rp "  SSH user     [${RU}]: " v; RU=${v:-$RU}
+            read -rp "  SSH port     [${SP}]: " v; SP=${v:-$SP}
+            read -rp "  Tunnel port  [${TP}]: " v; TP=${v:-$TP}
+            read -rp "  Local port   [${LP}]: " v; LP=${v:-$LP}
+            local cur_p="none"; [[ -n "$PC" ]] && cur_p="$PC"
+            echo -e "  Current proxy: ${DIM}${cur_p}${NC}"
+            read -rp "  New SOCKS5 (host:port), 'none' to clear, Enter to keep: " NP
+            if   [[ "$NP" == "none" ]]; then PC=""
+            elif [[ -n "$NP" ]];        then PC="ProxyCommand=nc -x ${NP%:*}:${NP##*:} -X 5 %h %p"
             fi
-
-            local NEW_ID="${NEW_HOST}:${NEW_TP}"
-            NEW_CONF+="${NEW_ID}|${NEW_USER}|${NEW_HOST}|${NEW_SSH_PORT}|${NEW_TP}|${NEW_LP}|${NEW_PROXY_CMD}\n"
-            ok "Tunnel #${EDIT_NUM} updated"
+            NEW+="${RH}:${TP}|${RU}|${RH}|${SP}|${TP}|${LP}|${PC}\n"
+            ok "Tunnel #${N} updated"
         else
-            NEW_CONF+="${ID}|${REMOTE_USER}|${REMOTE_HOST}|${SSH_PORT}|${TUNNEL_PORT}|${LOCAL_PORT}|${PROXY_CMD}\n"
+            NEW+="${ID}|${RU}|${RH}|${SP}|${TP}|${LP}|${PC}\n"
         fi
         (( i++ ))
     done < "$TUNNELS_FILE"
-
-    [[ $FOUND -eq 0 ]] && { err "Tunnel #${EDIT_NUM} not found"; return; }
-
-    printf "%b" "$NEW_CONF" > "$TUNNELS_FILE"
+    [[ $FOUND -eq 0 ]] && { err "Not found"; return; }
+    printf "%b" "$NEW" > "$TUNNELS_FILE"
     generate_tunnel_script
-    systemctl restart ssh-tunnel && ok "Service restarted with updated config"
-    sleep 1
+    systemctl restart ssh-tunnel && ok "Service restarted"
 }
 
 uninstall_all() {
     banner
-    echo -e "${BOLD}  ► Uninstall${NC}"
-    hr
-    echo ""
-    warn "This will remove all tunnels and service files:"
-    info "  Service:  ssh-tunnel"
-    info "  Script:   $TUNNEL_SCRIPT"
-    info "  Config:   $CONFIG_DIR"
-    info "  Unit:     $SERVICE_FILE"
-    echo ""
-    read -rp "  Type 'yes' to confirm uninstall: " CONFIRM
-    if [[ "$CONFIRM" != "yes" ]]; then
-        warn "Cancelled."
-        sleep 1
-        return
-    fi
-
-    systemctl stop    ssh-tunnel 2>/dev/null; ok "Service stopped"
-    systemctl disable ssh-tunnel 2>/dev/null; ok "Service disabled"
-    rm -f  "$SERVICE_FILE"  && ok "Unit file removed"
-    rm -f  "$TUNNEL_SCRIPT" && ok "Runner script removed"
-    rm -rf "$CONFIG_DIR"    && ok "Config directory removed"
+    echo -e "${BOLD}  ► Uninstall${NC}"; hr; echo ""
+    warn "This will remove the service, script, and config."
+    read -rp "  Type 'yes' to confirm: " C
+    [[ "$C" != "yes" ]] && { warn "Cancelled."; sleep 1; return; }
+    systemctl stop    ssh-tunnel 2>/dev/null; ok "Stopped"
+    systemctl disable ssh-tunnel 2>/dev/null; ok "Disabled"
+    rm -f  "$SERVICE_FILE"  && ok "Unit removed"
+    rm -f  "$TUNNEL_SCRIPT" && ok "Script removed"
+    rm -rf "$CONFIG_DIR"    && ok "Config removed"
     systemctl daemon-reload
-
-    echo ""
-    ok "Uninstall complete!"
-    echo ""
-    exit 0
+    echo ""; ok "Uninstall complete!"; echo ""; exit 0
 }
 
 # ─────────────────────────────────────────────────────
-#  MAIN MENU  (single flat menu)
+#  MAIN MENU
 # ─────────────────────────────────────────────────────
 
 main() {
@@ -723,18 +711,12 @@ main() {
 
     while true; do
         banner
-
-        # Service status line
-        if systemctl is-active ssh-tunnel &>/dev/null 2>&1; then
-            echo -e "  Service: ${GREEN}${BOLD}RUNNING${NC}"
-        else
-            echo -e "  Service: ${RED}${BOLD}STOPPED${NC}"
-        fi
-        echo ""
-        hr
-        echo ""
-        echo "  1) Client Setup   — set up tunnel from this server to VPS"
-        echo "  2) Server Setup   — configure VPS to accept tunnels"
+        systemctl is-active ssh-tunnel &>/dev/null \
+            && echo -e "  Service: ${GREEN}${BOLD}RUNNING${NC}" \
+            || echo -e "  Service: ${RED}${BOLD}STOPPED${NC}"
+        echo ""; hr; echo ""
+        echo "  1) Client Setup   — Iran server creates tunnel to VPS"
+        echo "  2) Server Setup   — VPS receives tunnel"
         echo "  3) List tunnels"
         echo "  4) Edit tunnel"
         echo "  5) Delete tunnel"
@@ -742,24 +724,19 @@ main() {
         echo "  7) View live logs"
         echo "  8) Uninstall"
         echo "  0) Exit"
-        echo ""
-        hr
+        echo ""; hr
         read -rp "  Choice: " CHOICE
-
         case "$CHOICE" in
             1) setup_client ;;
             2) setup_server ;;
-            3) list_tunnels; read -rp "  [Press Enter to continue]" ;;
-            4) edit_tunnel;  read -rp "  [Press Enter to continue]" ;;
-            5) delete_tunnel; read -rp "  [Press Enter to continue]" ;;
-            6) systemctl restart ssh-tunnel && ok "Service restarted"; sleep 1 ;;
-            7)
-                echo -e "  ${DIM}Press Ctrl+C to exit logs${NC}"
-                journalctl -u ssh-tunnel -f
-                ;;
+            3) list_tunnels; read -rp "  [Enter to continue]" ;;
+            4) edit_tunnel;  read -rp "  [Enter to continue]" ;;
+            5) delete_tunnel; read -rp "  [Enter to continue]" ;;
+            6) systemctl restart ssh-tunnel && ok "Restarted"; sleep 1 ;;
+            7) echo -e "  ${DIM}Ctrl+C to exit${NC}"; journalctl -u ssh-tunnel -f ;;
             8) uninstall_all ;;
             0) echo ""; exit 0 ;;
-            *) warn "Invalid choice"; sleep 1 ;;
+            *) warn "Invalid"; sleep 1 ;;
         esac
     done
 }
