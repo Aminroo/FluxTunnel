@@ -141,9 +141,9 @@ setup_server() {
 
     set_sshd() {
         local key="$1" val="$2"
-        grep -q "^${key}" "$SSHD" \
-            && sed -i "s/^${key}.*/${key} ${val}/" "$SSHD" \
-            || echo "${key} ${val}" >> "$SSHD"
+        # Remove any commented-out or existing lines for this key, then append clean value
+        sed -i "/^#*\s*${key}\b/d" "$SSHD"
+        echo "${key} ${val}" >> "$SSHD"
     }
 
     set_sshd "GatewayPorts"       "yes"
@@ -151,6 +151,13 @@ setup_server() {
     set_sshd "ClientAliveInterval" "30"
     set_sshd "ClientAliveCountMax" "6"
     systemctl restart sshd && ok "sshd restarted — GatewayPorts=yes active"
+
+    # Verify GatewayPorts actually took effect
+    if sshd -T 2>/dev/null | grep -qi "gatewayports yes"; then
+        ok "Verified: GatewayPorts=yes is active"
+    else
+        warn "Could not verify GatewayPorts — check sshd_config manually"
+    fi
 
     echo ""
     echo -e "  How many tunnel ports do you want to open? ${DIM}(1–20, default 1)${NC}"
@@ -182,10 +189,64 @@ setup_server() {
     done
 
     hr
-    ok "Server ready!"
+    ok "Server ready! Tunnel ports: ${PORTS[*]}"
     echo ""
-    info "Tunnel ports: ${PORTS[*]}"
     info "Now run setup.sh on the Iran server and choose 'Client Setup'."
+    echo ""
+
+    # Wait for Iran to connect — watch for tunnel ports to bind on 0.0.0.0
+    echo -e "  ${BOLD}Waiting for Iran client to connect...${NC}"
+    echo -e "  ${DIM}(watching for tunnel ports to appear on 0.0.0.0 — Ctrl+C to skip)${NC}"
+    echo ""
+
+    local all_up=0
+    local max_wait=300   # 5 minutes
+    local elapsed=0
+
+    while [[ $elapsed -lt $max_wait ]]; do
+        all_up=1
+        for p in "${PORTS[@]}"; do
+            # Port is ready when it binds on 0.0.0.0 (not just 127.0.0.1)
+            if ! ss -tlnp 2>/dev/null | grep -q "0\.0\.0\.0:${p}"; then
+                all_up=0
+                break
+            fi
+        done
+
+        if [[ $all_up -eq 1 ]]; then
+            echo ""
+            ok "All tunnel ports are up on 0.0.0.0!"
+            for p in "${PORTS[@]}"; do
+                ok "  Port ${p} → 0.0.0.0:${p} ✓"
+            done
+            echo ""
+            break
+        fi
+
+        # Show per-port status on one line
+        local status_line="  "
+        for p in "${PORTS[@]}"; do
+            if ss -tlnp 2>/dev/null | grep -q "0\.0\.0\.0:${p}"; then
+                status_line+="${GREEN}${p}✓${NC}  "
+            else
+                status_line+="${RED}${p}…${NC}  "
+            fi
+        done
+        printf "\r  Waiting: %s  [%ds]   " "$status_line" "$elapsed"
+
+        sleep 2
+        (( elapsed += 2 ))
+    done
+
+    if [[ $all_up -eq 0 ]]; then
+        echo ""
+        warn "Timeout — Iran client did not connect within ${max_wait}s"
+        warn "Check that:"
+        info "  1. Iran server ran Client Setup and service is running"
+        info "  2. Firewall allows ports: ${PORTS[*]}"
+        info "  3. GatewayPorts=yes is active: sshd -T | grep gatewayports"
+    fi
+
     echo ""
     read -rp "  [Press Enter to return to menu]"
 }
