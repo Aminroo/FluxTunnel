@@ -139,27 +139,69 @@ setup_server() {
     step "Configuring sshd..."
     local SSHD="/etc/ssh/sshd_config"
 
+    # ── Remove GatewayPorts from ALL possible locations ──────────────────
+    step "Cleaning GatewayPorts from all sshd config locations..."
+
+    # 1. Main config file
+    sed -i "/^#*\s*GatewayPorts\b/Id" "$SSHD"
+
+    # 2. Drop-in directory (sshd_config.d/*.conf)
+    local dropins=()
+    for f in /etc/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config.d/*.cfg 2>/dev/null; do
+        [[ -f "$f" ]] || continue
+        if grep -qi "GatewayPorts" "$f"; then
+            sed -i "/^#*\s*GatewayPorts\b/Id" "$f"
+            ok "  Cleaned: $f"
+        fi
+        dropins+=("$f")
+    done
+
+    # 3. Any Include directives pointing elsewhere
+    local includes
+    includes=$(grep -i "^Include" "$SSHD" | awk '{print $2}')
+    for pattern in $includes; do
+        for f in $pattern; do
+            [[ -f "$f" ]] || continue
+            if grep -qi "GatewayPorts" "$f"; then
+                sed -i "/^#*\s*GatewayPorts\b/Id" "$f"
+                ok "  Cleaned included file: $f"
+            fi
+        done
+    done
+
+    # 4. Write our value at the TOP of main config (before any Include)
+    #    so it takes precedence
+    local tmp_sshd
+    tmp_sshd=$(mktemp)
+    echo "GatewayPorts clientspecified" > "$tmp_sshd"
+    cat "$SSHD" >> "$tmp_sshd"
+    mv "$tmp_sshd" "$SSHD"
+    ok "GatewayPorts clientspecified written at top of $SSHD"
+
+    # ── Other required settings ───────────────────────────────────────────
     set_sshd() {
         local key="$1" val="$2"
-        # Remove any commented-out or existing lines for this key, then append clean value
-        sed -i "/^#*\s*${key}\b/d" "$SSHD"
+        sed -i "/^#*\s*${key}\b/Id" "$SSHD"
         echo "${key} ${val}" >> "$SSHD"
     }
-
-    # "clientspecified" lets the client's explicit 0.0.0.0 in -R bind correctly.
-    set_sshd "GatewayPorts"       "clientspecified"
     set_sshd "AllowTcpForwarding"  "yes"
     set_sshd "ClientAliveInterval" "30"
     set_sshd "ClientAliveCountMax" "6"
+
     systemctl restart sshd && ok "sshd restarted"
 
-    # Verify
+    # ── Hard verify via sshd -T (runtime effective config) ───────────────
+    sleep 1
     local gp_val
     gp_val=$(sshd -T 2>/dev/null | grep -i "^gatewayports" | awk '{print $2}')
     if [[ "$gp_val" == "clientspecified" || "$gp_val" == "yes" ]]; then
-        ok "Verified: GatewayPorts=${gp_val}"
+        ok "Verified effective GatewayPorts=${gp_val}"
     else
-        warn "GatewayPorts may not be active (got: '${gp_val}') — check: sshd -T | grep gatewayports"
+        err "GatewayPorts is still '${gp_val}' after all fixes!"
+        warn "Manual check:"
+        info "  sshd -T | grep gatewayports"
+        info "  grep -ri gatewayports /etc/ssh/"
+        read -rp "  Fix manually then press Enter to continue, or Ctrl+C to abort: "
     fi
 
     echo ""
