@@ -156,7 +156,7 @@ ask_proxy() {
         proxy_port="${PROXY_ADDR##*:}"
         [[ -z "$proxy_host" || -z "$proxy_port" ]] && { err "Format: host:port"; exit 1; }
 
-        PROXY_CMD="ProxyCommand=nc -x ${proxy_host} -p ${proxy_port} -X 5 %h %p"
+        PROXY_CMD="ProxyCommand=nc -x ${proxy_host}:${proxy_port} -X 5 %h %p"
         ok "SOCKS5 proxy: $PROXY_ADDR"
     fi
 }
@@ -502,7 +502,7 @@ edit_tunnel() {
             elif [[ -n "$NEW_PROXY_RAW" ]]; then
                 local ph="${NEW_PROXY_RAW%:*}"
                 local pp="${NEW_PROXY_RAW##*:}"
-                NEW_PROXY_CMD="ProxyCommand=nc -x ${ph} -p ${pp} -X 5 %h %p"
+                NEW_PROXY_CMD="ProxyCommand=nc -x ${ph}:${pp} -X 5 %h %p"
             fi
 
             local NEW_ID="${NEW_HOST}:${NEW_TUNNEL_PORT}"
