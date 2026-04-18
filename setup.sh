@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # =====================================================
-#   SSH Reverse Tunnel Manager v2.1
-#   github.com/your-repo
+#   SSH Reverse Tunnel Manager v2.2
 #   Usage: sudo bash setup.sh
 # =====================================================
 
@@ -28,8 +27,8 @@ banner() {
     clear
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║     SSH Reverse Tunnel Manager  v2.1         ║"
-    echo "  ║     Eran  →  Kharej  (SOCKS5 proxy support)  ║"
+    echo "  ║     SSH Reverse Tunnel Manager  v2.2         ║"
+    echo "  ║     Iran  →  VPS  (SOCKS5 proxy support)     ║"
     echo "  ╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -50,6 +49,47 @@ ensure_config_dir() {
     touch "$TUNNELS_FILE"
 }
 
+# ─────────────────────────────────────────────────────
+#  Ask for SOCKS5 proxy (used for installs + SSH)
+# ─────────────────────────────────────────────────────
+
+ask_proxy() {
+    echo ""
+    echo -e "  ${BOLD}Proxy Configuration${NC}"
+    echo -e "  Do you have a SOCKS5 proxy to connect to the remote server?"
+    echo -e "  ${DIM}(Required if outbound connections are restricted on this server)${NC}"
+    echo ""
+    echo "    1) Yes — I have a SOCKS5 proxy"
+    echo "    2) No  — connect directly"
+    echo ""
+    read -rp "  Choice [1/2, default 2]: " PROXY_CHOICE
+    PROXY_CHOICE=${PROXY_CHOICE:-2}
+
+    PROXY_CMD=""
+    PROXY_ADDR=""
+    APT_PROXY_ARGS=""
+
+    if [[ "$PROXY_CHOICE" == "1" ]]; then
+        echo ""
+        read -rp "  SOCKS5 proxy address (e.g. 127.0.0.1:1080): " PROXY_ADDR
+        [[ -z "$PROXY_ADDR" ]] && { err "Proxy address required"; exit 1; }
+
+        local proxy_host proxy_port
+        proxy_host="${PROXY_ADDR%:*}"
+        proxy_port="${PROXY_ADDR##*:}"
+        [[ -z "$proxy_host" || -z "$proxy_port" ]] && { err "Format must be host:port"; exit 1; }
+
+        PROXY_CMD="ProxyCommand=nc -x ${proxy_host}:${proxy_port} -X 5 %h %p"
+        # For apt/curl installs via proxy
+        APT_PROXY_ARGS="-o Acquire::http::proxy=\"socks5h://${PROXY_ADDR}\" -o Acquire::https::proxy=\"socks5h://${PROXY_ADDR}\""
+        ok "SOCKS5 proxy set: $PROXY_ADDR"
+    fi
+}
+
+# ─────────────────────────────────────────────────────
+#  Install dependencies (proxy-aware)
+# ─────────────────────────────────────────────────────
+
 install_deps() {
     step "Checking dependencies..."
     local pkgs=()
@@ -58,20 +98,42 @@ install_deps() {
 
     if [[ ${#pkgs[@]} -gt 0 ]]; then
         step "Installing: ${pkgs[*]}"
-        apt-get install -y "${pkgs[@]}" -q 2>/dev/null \
-        || yum install -y "${pkgs[@]}" -q 2>/dev/null \
-        || warn "Could not auto-install: ${pkgs[*]} — install manually"
+        if command -v apt-get &>/dev/null; then
+            if [[ -n "$APT_PROXY_ARGS" ]]; then
+                step "Using SOCKS5 proxy for apt..."
+                eval apt-get install -y "${pkgs[@]}" -q $APT_PROXY_ARGS 2>/dev/null
+            else
+                apt-get install -y "${pkgs[@]}" -q 2>/dev/null
+            fi
+        elif command -v yum &>/dev/null; then
+            if [[ -n "$PROXY_ADDR" ]]; then
+                http_proxy="socks5h://${PROXY_ADDR}" yum install -y "${pkgs[@]}" -q 2>/dev/null
+            else
+                yum install -y "${pkgs[@]}" -q 2>/dev/null
+            fi
+        else
+            warn "Could not auto-install: ${pkgs[*]} — please install manually"
+            return
+        fi
+
+        # Verify
+        local failed=()
+        for pkg in "${pkgs[@]}"; do
+            local bin="${pkg%%-*}"  # e.g. netcat-openbsd -> netcat, sshpass -> sshpass
+            command -v "$bin" &>/dev/null || command -v nc &>/dev/null || failed+=("$pkg")
+        done
+        [[ ${#failed[@]} -gt 0 ]] && warn "Could not install: ${failed[*]} — install manually if needed"
     fi
     ok "Dependencies OK"
 }
 
 # ─────────────────────────────────────────────────────
-#  SERVER SETUP  (Kharej / VPS side)
+#  SERVER SETUP  (VPS side)
 # ─────────────────────────────────────────────────────
 
 setup_server() {
     banner
-    echo -e "${BOLD}  ► Server Setup  (Kharej / VPS)${NC}"
+    echo -e "${BOLD}  ► Server Setup  (VPS / Kharej)${NC}"
     hr
 
     step "Configuring sshd..."
@@ -91,9 +153,8 @@ setup_server() {
     systemctl restart sshd && ok "sshd restarted — GatewayPorts=yes active"
 
     echo ""
-    # Finglish prompt
-    echo -e "  Chand ta tunnel port mikhai baz koni? ${DIM}(1–20, default 1)${NC}"
-    read -rp "  Tedad: " PORT_COUNT
+    echo -e "  How many tunnel ports do you want to open? ${DIM}(1–20, default 1)${NC}"
+    read -rp "  Count: " PORT_COUNT
     PORT_COUNT=${PORT_COUNT:-1}
     [[ ! "$PORT_COUNT" =~ ^[0-9]+$ || "$PORT_COUNT" -lt 1 || "$PORT_COUNT" -gt 20 ]] \
         && { err "Invalid number"; exit 1; }
@@ -124,54 +185,22 @@ setup_server() {
     ok "Server ready!"
     echo ""
     info "Tunnel ports: ${PORTS[*]}"
-    # Finglish tip
-    info "Hala ro server Eran, setup.sh ro ejra kon."
+    info "Now run setup.sh on the Iran server and choose 'Client Setup'."
     echo ""
+    read -rp "  [Press Enter to return to menu]"
 }
 
 # ─────────────────────────────────────────────────────
-#  CLIENT SETUP  (Eran side)
+#  CLIENT SETUP  (Iran side)
 # ─────────────────────────────────────────────────────
-
-ask_proxy() {
-    echo ""
-    echo -e "  ${BOLD}Proxy Configuration${NC}"
-    # Finglish question
-    echo -e "  Proxy SOCKS5 dari baraye vasl shodan be server kharej?"
-    echo -e "  ${DIM}(If outbound is restricted on your Iran server)${NC}"
-    echo ""
-    echo "    1) Dare  — SOCKS5 proxy daram"
-    echo "    2) Nist  — direct connect"
-    echo ""
-    read -rp "  Choice [1/2, default 2]: " PROXY_CHOICE
-    PROXY_CHOICE=${PROXY_CHOICE:-2}
-
-    PROXY_CMD=""
-    PROXY_ADDR=""
-
-    if [[ "$PROXY_CHOICE" == "1" ]]; then
-        echo ""
-        read -rp "  SOCKS5 proxy address (e.g. 188.121.124.130:1080): " PROXY_ADDR
-        [[ -z "$PROXY_ADDR" ]] && { err "Proxy address required"; exit 1; }
-
-        local proxy_host proxy_port
-        proxy_host="${PROXY_ADDR%:*}"
-        proxy_port="${PROXY_ADDR##*:}"
-        [[ -z "$proxy_host" || -z "$proxy_port" ]] && { err "Format: host:port"; exit 1; }
-
-        PROXY_CMD="ProxyCommand=nc -x ${proxy_host}:${proxy_port} -X 5 %h %p"
-        ok "SOCKS5 proxy set: $PROXY_ADDR"
-    fi
-}
 
 ask_auth() {
     echo ""
     echo -e "  ${BOLD}Authentication${NC}"
-    # Finglish
-    echo -e "  Roosh vasl shodan be server kharej:"
+    echo -e "  How do you want to authenticate to the remote server?"
     echo ""
-    echo "    1) Ba ramz (password)  — script khodesh key copy mikone"
-    echo "    2) Key daram           — no password needed"
+    echo "    1) Password  — script will copy the SSH key automatically"
+    echo "    2) Key-based — SSH key already installed on remote server"
     echo ""
     read -rp "  Choice [1/2, default 1]: " AUTH_CHOICE
     AUTH_CHOICE=${AUTH_CHOICE:-1}
@@ -179,7 +208,7 @@ ask_auth() {
     REMOTE_PASS=""
     if [[ "$AUTH_CHOICE" == "1" ]]; then
         echo ""
-        read -rsp "  Ramz SSH server kharej: " REMOTE_PASS
+        read -rsp "  SSH password for remote server: " REMOTE_PASS
         echo ""
         [[ -z "$REMOTE_PASS" ]] && { err "Password required"; exit 1; }
         ok "Password received"
@@ -215,6 +244,22 @@ copy_ssh_key() {
         ok "SSH key found: ~/.ssh/id_rsa"
     fi
 
+    # Make sure sshpass is installed
+    if [[ -n "$REMOTE_PASS" ]] && ! command -v sshpass &>/dev/null; then
+        step "sshpass not found — attempting to install..."
+        install_deps
+        if ! command -v sshpass &>/dev/null; then
+            err "sshpass could not be installed."
+            echo ""
+            warn "Please add this public key manually to the remote server's ~/.ssh/authorized_keys:"
+            echo ""
+            echo -e "  ${YELLOW}$(cat ~/.ssh/id_rsa.pub)${NC}"
+            echo ""
+            read -rp "  Press Enter after adding the key, or Ctrl+C to cancel: "
+            return
+        fi
+    fi
+
     step "Copying SSH key to remote server..."
     local COPY_ARGS=()
     [[ -n "$PROXY_CMD" ]] && COPY_ARGS+=(-o "$PROXY_CMD")
@@ -227,14 +272,13 @@ copy_ssh_key() {
     fi
 
     if [[ $? -eq 0 ]]; then
-        ok "SSH key installed — passwordless from now on"
+        ok "SSH key installed — passwordless login active"
     else
         warn "ssh-copy-id failed — add this key manually to remote authorized_keys:"
         echo ""
         echo -e "  ${YELLOW}$(cat ~/.ssh/id_rsa.pub)${NC}"
         echo ""
-        # Finglish
-        read -rp "  Ba ezafe kardan key Enter bezan, ya Ctrl+C baraye cancel: "
+        read -rp "  Press Enter after adding the key, or Ctrl+C to cancel: "
     fi
 }
 
@@ -246,7 +290,7 @@ wait_for_connection() {
     local MAX_WAIT=60
     local elapsed=0
 
-    step "Waiting for successful connection to ${REMOTE_HOST}:${SSH_PORT}..."
+    step "Testing connection to ${REMOTE_HOST}:${SSH_PORT}..."
     echo -e "  ${DIM}(timeout ${MAX_WAIT}s)${NC}"
 
     while [[ $elapsed -lt $MAX_WAIT ]]; do
@@ -281,7 +325,7 @@ generate_tunnel_script() {
 
     cat > "$TUNNEL_SCRIPT" << 'SCRIPT_EOF'
 #!/bin/bash
-# Auto-generated by SSH Tunnel Manager v2.1
+# Auto-generated by SSH Tunnel Manager v2.2
 CONFIG_DIR="/etc/ssh-tunnel"
 TUNNELS_FILE="$CONFIG_DIR/tunnels.conf"
 LOG_FILE="$CONFIG_DIR/tunnel.log"
@@ -354,16 +398,20 @@ SVC_EOF
 
 setup_client() {
     banner
-    echo -e "${BOLD}  ► Client Setup  (Eran / restricted server)${NC}"
+    echo -e "${BOLD}  ► Client Setup  (Iran / restricted server)${NC}"
     hr
 
     ensure_config_dir
-    install_deps
 
+    # Step 1: proxy first (needed for installs too)
     ask_proxy
 
+    # Step 2: install deps using proxy if set
+    install_deps
+
+    # Step 3: remote server info
     echo ""
-    echo -e "  ${BOLD}Remote Server (Kharej / VPS)${NC}"
+    echo -e "  ${BOLD}Remote Server (VPS / Kharej)${NC}"
     read -rp "  SSH host (IP or domain): " REMOTE_HOST
     [[ -z "$REMOTE_HOST" ]] && { err "Host required"; exit 1; }
 
@@ -373,13 +421,14 @@ setup_client() {
     read -rp "  SSH port [default 22]: " SSH_PORT
     SSH_PORT=${SSH_PORT:-22}
 
+    # Step 4: auth
     ask_auth
 
+    # Step 5: tunnel ports
     echo ""
-    echo -e "  ${BOLD}Tunnel Ports${NC}"
-    # Finglish
-    echo -e "  Chand ta tunnel mikhai besazi? ${DIM}(1–20, default 1)${NC}"
-    read -rp "  Tedad: " TUNNEL_COUNT
+    echo -e "  ${BOLD}Tunnel Configuration${NC}"
+    echo -e "  How many tunnels do you want to create? ${DIM}(1–20, default 1)${NC}"
+    read -rp "  Count: " TUNNEL_COUNT
     TUNNEL_COUNT=${TUNNEL_COUNT:-1}
     [[ ! "$TUNNEL_COUNT" =~ ^[0-9]+$ || "$TUNNEL_COUNT" -lt 1 || "$TUNNEL_COUNT" -gt 20 ]] \
         && { err "Invalid number"; exit 1; }
@@ -389,25 +438,27 @@ setup_client() {
         echo ""
         echo -e "  ${CYAN}── Tunnel #${i} ──${NC}"
         local default_t=$(( 20000 + i - 1 ))
-        # Finglish
-        read -rp "  Port tunnel ro server kharej [default ${default_t}]: " TUNNEL_PORT
+        read -rp "  Remote tunnel port on VPS [default ${default_t}]: " TUNNEL_PORT
         TUNNEL_PORT=${TUNNEL_PORT:-$default_t}
 
-        read -rp "  Local port ke forward mishe [default ${TUNNEL_PORT}]: " LOCAL_PORT
+        read -rp "  Local port to forward [default ${TUNNEL_PORT}]: " LOCAL_PORT
         LOCAL_PORT=${LOCAL_PORT:-$TUNNEL_PORT}
 
         ENTRIES+=("$(build_tunnel_entry "$REMOTE_USER" "$REMOTE_HOST" "$SSH_PORT" "$TUNNEL_PORT" "$LOCAL_PORT" "$PROXY_CMD")")
         ok "Tunnel #${i}: local:${LOCAL_PORT} → ${REMOTE_HOST}:${TUNNEL_PORT}"
     done
 
+    # Step 6: copy SSH key
     copy_ssh_key "$REMOTE_USER" "$REMOTE_HOST" "$SSH_PORT" "$PROXY_CMD" "$REMOTE_PASS"
 
+    # Step 7: test connection
     wait_for_connection "$REMOTE_HOST" "$SSH_PORT" "$PROXY_CMD" "$REMOTE_USER"
     if [[ $? -ne 0 ]]; then
         err "Connection failed — setup aborted"
         exit 1
     fi
 
+    # Step 8: save and start
     step "Saving tunnel config..."
     for entry in "${ENTRIES[@]}"; do
         echo "$entry" >> "$TUNNELS_FILE"
@@ -420,25 +471,23 @@ setup_client() {
     systemctl restart ssh-tunnel
     sleep 2
 
-    if systemctl is-active ssh-tunnel &>/dev/null; then
-        ok "Service ssh-tunnel is running!"
-    else
-        warn "Service may have issues — check: journalctl -u ssh-tunnel -f"
-    fi
-
     hr
-    echo ""
-    echo -e "${GREEN}${BOLD}  ✓ Setup complete! ${TUNNEL_COUNT} tunnel(s) active.${NC}"
+    if systemctl is-active ssh-tunnel &>/dev/null; then
+        echo ""
+        echo -e "${GREEN}${BOLD}  ✓ Setup complete! ${TUNNEL_COUNT} tunnel(s) active.${NC}"
+    else
+        echo ""
+        warn "Service may have issues — run: journalctl -u ssh-tunnel -f"
+    fi
     echo ""
     info "Status:  systemctl status ssh-tunnel"
     info "Logs:    journalctl -u ssh-tunnel -f"
-    # Finglish tip
-    info "Modiriat: sudo bash setup.sh → Admin Panel"
     echo ""
+    read -rp "  [Press Enter to return to menu]"
 }
 
 # ─────────────────────────────────────────────────────
-#  ADMIN PANEL functions
+#  TUNNEL MANAGEMENT
 # ─────────────────────────────────────────────────────
 
 list_tunnels() {
@@ -478,8 +527,7 @@ list_tunnels() {
 
 delete_tunnel() {
     list_tunnels || return
-    # Finglish
-    read -rp "  Shomare tunnel baraye hazf (0 = cancel): " DEL_NUM
+    read -rp "  Tunnel number to delete (0 = cancel): " DEL_NUM
     [[ "$DEL_NUM" == "0" || -z "$DEL_NUM" ]] && return
 
     local i=1 NEW_CONF=""
@@ -500,8 +548,7 @@ delete_tunnel() {
 
 edit_tunnel() {
     list_tunnels || return
-    # Finglish
-    read -rp "  Shomare tunnel baraye edit (0 = cancel): " EDIT_NUM
+    read -rp "  Tunnel number to edit (0 = cancel): " EDIT_NUM
     [[ "$EDIT_NUM" == "0" || -z "$EDIT_NUM" ]] && return
 
     local i=1 FOUND=0 NEW_CONF=""
@@ -511,7 +558,7 @@ edit_tunnel() {
         if [[ "$i" -eq "$EDIT_NUM" ]]; then
             FOUND=1
             echo ""
-            echo -e "  ${BOLD}Edit Tunnel #${EDIT_NUM}${NC}  (Enter = keep current)"
+            echo -e "  ${BOLD}Edit Tunnel #${EDIT_NUM}${NC}  (Enter = keep current value)"
             echo ""
 
             read -rp "  Remote host  [${REMOTE_HOST}]: "  NEW_HOST;     NEW_HOST=${NEW_HOST:-$REMOTE_HOST}
@@ -548,102 +595,22 @@ edit_tunnel() {
     printf "%b" "$NEW_CONF" > "$TUNNELS_FILE"
     generate_tunnel_script
     systemctl restart ssh-tunnel && ok "Service restarted with updated config"
-}
-
-change_ports() {
-    banner
-    echo -e "${BOLD}  ► Change Tunnel Ports${NC}"
-    hr
-
-    list_tunnels || { read -rp "  [Enter to go back]"; return; }
-
-    # Finglish
-    read -rp "  Shomare tunnel baraye taghir port (0 = cancel): " SEL
-    [[ "$SEL" == "0" || -z "$SEL" ]] && return
-
-    local i=1 FOUND=0 NEW_CONF=""
-
-    while IFS='|' read -r ID REMOTE_USER REMOTE_HOST SSH_PORT TUNNEL_PORT LOCAL_PORT PROXY_CMD; do
-        [[ -z "$ID" || "$ID" == \#* ]] && continue
-        if [[ "$i" -eq "$SEL" ]]; then
-            FOUND=1
-            echo ""
-            echo -e "  ${BOLD}Change Ports — Tunnel #${SEL}${NC}  (Enter = keep current)"
-            echo ""
-            read -rp "  SSH port    [current: ${SSH_PORT}]:    " NEW_SSH_PORT
-            NEW_SSH_PORT=${NEW_SSH_PORT:-$SSH_PORT}
-            read -rp "  Tunnel port [current: ${TUNNEL_PORT}]: " NEW_TP
-            NEW_TP=${NEW_TP:-$TUNNEL_PORT}
-            read -rp "  Local port  [current: ${LOCAL_PORT}]:  " NEW_LP
-            NEW_LP=${NEW_LP:-$LOCAL_PORT}
-
-            echo ""
-            ok "Ports updated:"
-            info "SSH port:    $SSH_PORT → $NEW_SSH_PORT"
-            info "Tunnel port: $TUNNEL_PORT → $NEW_TP"
-            info "Local port:  $LOCAL_PORT → $NEW_LP"
-
-            local NEW_ID="${REMOTE_HOST}:${NEW_TP}"
-            NEW_CONF+="${NEW_ID}|${REMOTE_USER}|${REMOTE_HOST}|${NEW_SSH_PORT}|${NEW_TP}|${NEW_LP}|${PROXY_CMD}\n"
-        else
-            NEW_CONF+="${ID}|${REMOTE_USER}|${REMOTE_HOST}|${SSH_PORT}|${TUNNEL_PORT}|${LOCAL_PORT}|${PROXY_CMD}\n"
-        fi
-        (( i++ ))
-    done < "$TUNNELS_FILE"
-
-    [[ $FOUND -eq 0 ]] && { err "Tunnel #${SEL} not found"; sleep 1; return; }
-
-    printf "%b" "$NEW_CONF" > "$TUNNELS_FILE"
-    generate_tunnel_script
-    systemctl restart ssh-tunnel && ok "Service restarted with new ports"
     sleep 1
-}
-
-add_tunnel_interactive() {
-    banner
-    echo -e "${BOLD}  ► Add New Tunnel${NC}"
-    hr
-
-    ask_proxy
-
-    read -rp "  Remote host (IP or domain): " REMOTE_HOST
-    [[ -z "$REMOTE_HOST" ]] && { err "Host required"; return; }
-
-    read -rp "  SSH user [default root]: " REMOTE_USER
-    REMOTE_USER=${REMOTE_USER:-root}
-
-    read -rp "  SSH port [default 22]: " SSH_PORT
-    SSH_PORT=${SSH_PORT:-22}
-
-    # Finglish
-    read -rp "  Port tunnel ro server kharej [default 20000]: " TUNNEL_PORT
-    TUNNEL_PORT=${TUNNEL_PORT:-20000}
-
-    read -rp "  Local port ke forward mishe [default ${TUNNEL_PORT}]: " LOCAL_PORT
-    LOCAL_PORT=${LOCAL_PORT:-$TUNNEL_PORT}
-
-    local ENTRY
-    ENTRY="$(build_tunnel_entry "$REMOTE_USER" "$REMOTE_HOST" "$SSH_PORT" "$TUNNEL_PORT" "$LOCAL_PORT" "$PROXY_CMD")"
-    echo "$ENTRY" >> "$TUNNELS_FILE"
-
-    generate_tunnel_script
-    systemctl restart ssh-tunnel && ok "Tunnel added — service restarted"
 }
 
 uninstall_all() {
     banner
-    echo -e "${BOLD}  ► Uninstall (Remove Everything)${NC}"
+    echo -e "${BOLD}  ► Uninstall${NC}"
     hr
     echo ""
-    warn "This will remove:"
-    info "  - Service:  ssh-tunnel"
-    info "  - Script:   $TUNNEL_SCRIPT"
-    info "  - Config:   $CONFIG_DIR"
-    info "  - Unit:     $SERVICE_FILE"
+    warn "This will remove all tunnels and service files:"
+    info "  Service:  ssh-tunnel"
+    info "  Script:   $TUNNEL_SCRIPT"
+    info "  Config:   $CONFIG_DIR"
+    info "  Unit:     $SERVICE_FILE"
     echo ""
-    # Finglish confirm
-    read -rp "  Motmaeni? Benevis 'bale' baraye edame: " CONFIRM
-    if [[ "$CONFIRM" != "bale" ]]; then
+    read -rp "  Type 'yes' to confirm uninstall: " CONFIRM
+    if [[ "$CONFIRM" != "yes" ]]; then
         warn "Cancelled."
         sleep 1
         return
@@ -663,116 +630,53 @@ uninstall_all() {
 }
 
 # ─────────────────────────────────────────────────────
-#  ADMIN PANEL
+#  MAIN MENU  (single flat menu)
 # ─────────────────────────────────────────────────────
 
-admin_panel() {
+main() {
+    require_root
+    ensure_config_dir
+
     while true; do
         banner
-        echo -e "${BOLD}  ► Admin Panel${NC}"
-        hr
-        echo ""
 
-        if systemctl is-active ssh-tunnel &>/dev/null; then
-            echo -e "  Service Status: ${GREEN}${BOLD}RUNNING${NC}"
+        # Service status line
+        if systemctl is-active ssh-tunnel &>/dev/null 2>&1; then
+            echo -e "  Service: ${GREEN}${BOLD}RUNNING${NC}"
         else
-            echo -e "  Service Status: ${RED}${BOLD}STOPPED${NC}"
+            echo -e "  Service: ${RED}${BOLD}STOPPED${NC}"
         fi
         echo ""
-        echo "  1)  List tunnels"
-        echo "  2)  Add tunnel"
-        echo "  3)  Edit tunnel"
-        echo "  4)  Delete tunnel"
-        echo "  5)  Change ports"
-        echo "  6)  Restart service"
-        echo "  7)  Stop service"
-        echo "  8)  Start service"
-        echo "  9)  Live logs"
-        echo "  10) View log file"
-        echo "  11) Uninstall"
-        echo "  0)  Back"
+        hr
+        echo ""
+        echo "  1) Client Setup   — set up tunnel from this server to VPS"
+        echo "  2) Server Setup   — configure VPS to accept tunnels"
+        echo "  3) List tunnels"
+        echo "  4) Edit tunnel"
+        echo "  5) Delete tunnel"
+        echo "  6) Restart service"
+        echo "  7) View live logs"
+        echo "  8) Uninstall"
+        echo "  0) Exit"
         echo ""
         hr
         read -rp "  Choice: " CHOICE
 
         case "$CHOICE" in
-            1)  list_tunnels; read -rp "  [Enter to continue]" ;;
-            2)  add_tunnel_interactive ;;
-            3)  edit_tunnel ;;
-            4)  delete_tunnel ;;
-            5)  change_ports ;;
-            6)  systemctl restart ssh-tunnel && ok "Service restarted"; sleep 1 ;;
-            7)  systemctl stop    ssh-tunnel && ok "Service stopped";   sleep 1 ;;
-            8)  systemctl start   ssh-tunnel && ok "Service started";   sleep 1 ;;
-            9)
-                echo -e "  ${DIM}Ctrl+C to exit logs${NC}"
+            1) setup_client ;;
+            2) setup_server ;;
+            3) list_tunnels; read -rp "  [Press Enter to continue]" ;;
+            4) edit_tunnel;  read -rp "  [Press Enter to continue]" ;;
+            5) delete_tunnel; read -rp "  [Press Enter to continue]" ;;
+            6) systemctl restart ssh-tunnel && ok "Service restarted"; sleep 1 ;;
+            7)
+                echo -e "  ${DIM}Press Ctrl+C to exit logs${NC}"
                 journalctl -u ssh-tunnel -f
                 ;;
-            10)
-                local LOG="$CONFIG_DIR/tunnel.log"
-                if [[ -f "$LOG" ]]; then
-                    tail -50 "$LOG" | less -R
-                else
-                    warn "Log file not found: $LOG"
-                    sleep 1
-                fi
-                ;;
-            11) uninstall_all ;;
-            0)  return ;;
-            *)  warn "Invalid choice"; sleep 1 ;;
+            8) uninstall_all ;;
+            0) echo ""; exit 0 ;;
+            *) warn "Invalid choice"; sleep 1 ;;
         esac
-    done
-}
-
-# ─────────────────────────────────────────────────────
-#  MAIN MENU
-# ─────────────────────────────────────────────────────
-
-main() {
-    require_root
-
-    while true; do
-        banner
-
-        if [[ -f "$TUNNELS_FILE" && -s "$TUNNELS_FILE" ]]; then
-            echo -e "  ${BOLD}Main Menu${NC}"
-            echo ""
-            echo "  1) Admin Panel        (manage tunnels)"
-            echo "  2) Client Setup       (Eran server)"
-            echo "  3) Server Setup       (Kharej / VPS)"
-            echo "  4) Change Ports"
-            echo "  5) Uninstall"
-            echo "  0) Exit"
-            echo ""
-            hr
-            read -rp "  Choice: " CHOICE
-            case "$CHOICE" in
-                1) admin_panel ;;
-                2) setup_client ;;
-                3) setup_server ;;
-                4) ensure_config_dir; change_ports ;;
-                5) uninstall_all ;;
-                0) echo ""; exit 0 ;;
-                *) warn "Invalid choice"; sleep 1 ;;
-            esac
-        else
-            echo -e "  ${BOLD}Main Menu${NC}"
-            echo ""
-            echo "  1) Client Setup   (Eran — creates tunnel outward)"
-            echo "  2) Server Setup   (Kharej / VPS — receives tunnel)"
-            echo "  3) Admin Panel"
-            echo "  0) Exit"
-            echo ""
-            hr
-            read -rp "  Choice: " MODE
-            case "$MODE" in
-                1) setup_client ;;
-                2) setup_server ;;
-                3) ensure_config_dir; admin_panel ;;
-                0) echo ""; exit 0 ;;
-                *) err "Invalid choice"; sleep 1 ;;
-            esac
-        fi
     done
 }
 
