@@ -696,18 +696,36 @@ run_tunnel() {
     # monitor port یکتا بر اساس ID
     local MON=$(( 20200 + (ID % 100) ))
 
+    # ─── ساخت ssh_config موقت برای این tunnel ───
+    # مشکل: پاس دادن ProxyCommand از طریق -o در آرایه bash
+    # باعث میشه autossh نتونه مسیر nc رو پیدا کنه (No such file or directory)
+    # راه‌حل: نوشتن همه تنظیمات در یه فایل ssh_config موقت
+    local SSH_CFG="${CONFIG_DIR}/ssh_t${ID}.conf"
+    {
+        echo "Host ${RH}"
+        echo "    Port ${SP}"
+        echo "    User ${RU}"
+        echo "    ServerAliveInterval 10"
+        echo "    ServerAliveCountMax 3"
+        echo "    ExitOnForwardFailure yes"
+        echo "    StrictHostKeyChecking accept-new"
+        echo "    ConnectTimeout 15"
+        echo "    TCPKeepAlive yes"
+        echo "    BatchMode yes"
+        # ProxyCommand فقط اگه تنظیم شده باشه
+        if [[ -n "$PC" ]]; then
+            # PC فرمتش: "ProxyCommand=nc -x host:port -X 5 %h %p"
+            # باید بدون = و بدون quotes بنویسیم
+            local pc_val="${PC#ProxyCommand=}"
+            echo "    ProxyCommand ${pc_val}"
+        fi
+    } > "$SSH_CFG"
+    chmod 600 "$SSH_CFG"
+
     local BASE_OPTS=(
-        -o "ServerAliveInterval=10"
-        -o "ServerAliveCountMax=3"
-        -o "ExitOnForwardFailure=yes"
-        -o "StrictHostKeyChecking=accept-new"
-        -o "ConnectTimeout=15"
-        -o "TCPKeepAlive=yes"
-        -o "BatchMode=yes"
-        -p "$SP"
+        -F "$SSH_CFG"
         -R "0.0.0.0:${TP}:127.0.0.1:${LP}"
     )
-    [[ -n "$PC" ]] && BASE_OPTS+=(-o "$PC")
 
     _ssh_once() {
         # اول بدون پسورد (key-based)
@@ -716,7 +734,6 @@ run_tunnel() {
         # اگه key کار نکرد، از پسورد ذخیره شده استفاده کن
         local pass; pass=$(load_password "$RH" "$SP" "$RU" 2>/dev/null)
         if [[ -n "$pass" ]] && command -v sshpass &>/dev/null; then
-            # پسورد از stdin به sshpass میره
             echo "$pass" | sshpass ssh -N "${BASE_OPTS[@]}" "${RU}@${RH}" 2>/dev/null \
                 && return 0
         fi
@@ -724,7 +741,7 @@ run_tunnel() {
     }
 
     if command -v autossh &>/dev/null; then
-        log "[T${ID}] Starting autossh → ${RH}:${TP} (monitor:${MON})"
+        log "[T${ID}] Starting autossh → ${RH}:${TP} (monitor:${MON}, cfg:${SSH_CFG})"
         while true; do
             AUTOSSH_GATETIME=0 \
             AUTOSSH_POLL=10 \
@@ -742,11 +759,10 @@ run_tunnel() {
         while true; do
             log "[T${ID}] Connecting to ${RH}:${TP}..."
             if _ssh_once; then
-                backoff=5  # reset backoff پس از اتصال موفق
+                backoff=5
             fi
             log "[T${ID}] Disconnected — retry in ${backoff}s..."
             sleep "$backoff"
-            # exponential backoff تا حداکثر 60 ثانیه
             (( backoff = backoff < 60 ? backoff * 2 : 60 ))
         done
     fi
