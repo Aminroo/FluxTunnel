@@ -508,12 +508,42 @@ install_deps() {
 
     if [[ ${#pkgs[@]} -gt 0 ]]; then
         step "Installing: ${pkgs[*]}"
+
+        if [[ -n "${PROXY_ADDR:-}" ]]; then
+            # set کردن env variables برای همه ابزارها
+            export http_proxy="socks5h://${PROXY_ADDR}"
+            export https_proxy="socks5h://${PROXY_ADDR}"
+            step "Using SOCKS5 proxy for install: socks5h://${PROXY_ADDR}"
+        fi
+
         if command -v apt-get &>/dev/null; then
-            eval apt-get install -y -q "${pkgs[@]}" ${APT_PROXY_ARGS:-} 2>/dev/null
+            if [[ -n "${PROXY_ADDR:-}" ]]; then
+                # apt update با proxy
+                step "Running apt update via proxy..."
+                http_proxy="socks5h://${PROXY_ADDR}" \
+                https_proxy="socks5h://${PROXY_ADDR}" \
+                apt-get update -q \
+                    -o Acquire::http::proxy="socks5h://${PROXY_ADDR}" \
+                    -o Acquire::https::proxy="socks5h://${PROXY_ADDR}" \
+                    2>/dev/null && ok "apt update done" || warn "apt update failed — trying install anyway"
+                # apt install با proxy
+                http_proxy="socks5h://${PROXY_ADDR}" \
+                https_proxy="socks5h://${PROXY_ADDR}" \
+                apt-get install -y -q "${pkgs[@]}" \
+                    -o Acquire::http::proxy="socks5h://${PROXY_ADDR}" \
+                    -o Acquire::https::proxy="socks5h://${PROXY_ADDR}" \
+                    2>/dev/null
+            else
+                apt-get install -y -q "${pkgs[@]}" 2>/dev/null
+            fi
         elif command -v yum &>/dev/null; then
-            [[ -n "${PROXY_ADDR:-}" ]] \
-                && http_proxy="socks5h://${PROXY_ADDR}" yum install -y -q "${pkgs[@]}" 2>/dev/null \
-                || yum install -y -q "${pkgs[@]}" 2>/dev/null
+            if [[ -n "${PROXY_ADDR:-}" ]]; then
+                http_proxy="socks5h://${PROXY_ADDR}" \
+                https_proxy="socks5h://${PROXY_ADDR}" \
+                yum install -y -q "${pkgs[@]}" 2>/dev/null
+            else
+                yum install -y -q "${pkgs[@]}" 2>/dev/null
+            fi
         else
             warn "Cannot auto-install ${pkgs[*]} — install manually"
         fi
