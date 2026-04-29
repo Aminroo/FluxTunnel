@@ -7,7 +7,7 @@
 #   Usage   : sudo bash setup.sh
 # =====================================================
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 REPO_RAW="https://raw.githubusercontent.com/Aminroo/FluxTunnel/main/setup.sh"
 REPO_VER="https://raw.githubusercontent.com/Aminroo/FluxTunnel/main/VERSION"
 
@@ -24,6 +24,7 @@ CONFIG_DIR="/etc/ssh-tunnel"
 TUNNELS_FILE="$CONFIG_DIR/tunnels.conf"
 AUTH_FILE="$CONFIG_DIR/auth.conf"
 KEY_FILE="$CONFIG_DIR/.enc_key"
+PROXY_CONF_FILE="$CONFIG_DIR/proxy.conf"
 TUNNEL_SCRIPT="/usr/local/bin/ssh-tunnel"
 SERVICE_FILE="/etc/systemd/system/ssh-tunnel.service"
 MODE_FILE="$CONFIG_DIR/mode"   # "client" یا "server"
@@ -67,6 +68,38 @@ ensure_config_dir() {
         chmod 600 "$KEY_FILE"
         ok "Encryption key generated: $KEY_FILE"
     fi
+    # اضافه کردن متغیر PROXY_CONF_FILE اگه هنوز set نشده
+    PROXY_CONF_FILE="${PROXY_CONF_FILE:-${CONFIG_DIR}/proxy.conf}"
+}
+
+# ─────────────────────────────────────────────────────
+#  Migrate — آپگرید تنظیمات قدیمی پروکسی به فرمت جدید
+# ─────────────────────────────────────────────────────
+
+migrate_proxy_conf() {
+    # اگه فایل proxy.conf جدید وجود داشت، نیازی به migrate نیست
+    [[ -f "$PROXY_CONF_FILE" ]] && return 0
+    # بررسی تانل‌های قدیمی که ProxyCommand داشتن
+    [[ ! -s "$TUNNELS_FILE" ]] && return 0
+    local old_pc=""
+    while IFS='|' read -r ID RU RH SP TP LP PC; do
+        [[ -z "$ID" || "$ID" == \#* ]] && continue
+        [[ -n "$PC" ]] && { old_pc="$PC"; break; }
+    done < "$TUNNELS_FILE"
+    [[ -z "$old_pc" ]] && return 0
+
+    # استخراج host:port از ProxyCommand قدیمی
+    # فرمت: ProxyCommand=nc -x host:port -X 5 %h %p
+    local old_addr=""
+    old_addr=$(echo "$old_pc" | grep -oP '(?<=-x )\S+' 2>/dev/null || \
+               echo "$old_pc" | sed 's/.*-x \([^ ]*\).*/\1/' 2>/dev/null)
+    [[ -z "$old_addr" ]] && return 0
+
+    warn "Migrating old proxy config → $PROXY_CONF_FILE"
+    info "  Found proxy: $old_addr (no auth — plain format)"
+    save_proxy_conf "$old_addr" "" ""
+    ok "Migration complete — use 'Change Proxy' menu to add auth if needed"
+    return 0
 }
 
 # ─────────────────────────────────────────────────────
@@ -86,7 +119,27 @@ self_update() {
     fi
 
     local curl_opts=(-fsSL --max-time 15)
-    [[ -n "${PROXY_ADDR:-}" ]] && curl_opts+=(--proxy "socks5h://${PROXY_ADDR}")
+    if [[ -f "$PROXY_CONF_FILE" ]]; then
+        local upd_addr; upd_addr=$(grep "^PROXY_ADDR=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+        local upd_user; upd_user=$(grep "^PROXY_USER=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+        local upd_enc; upd_enc=$(grep "^PROXY_ENC_PASS=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+        if [[ -n "$upd_addr" ]]; then
+            local upd_pass=""
+            if [[ -n "$upd_enc" ]]; then
+                [[ "$upd_enc" == plain:* ]] \
+                    && upd_pass=$(printf '%s' "${upd_enc#plain:}" | base64 -d 2>/dev/null) \
+                    || upd_pass=$(printf '%s' "$upd_enc" | base64 -d 2>/dev/null \
+                        | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+                          -pass "pass:$(_enc_key)" 2>/dev/null)
+            fi
+            local proxy_url="socks5h://${upd_addr}"
+            [[ -n "$upd_user" && -n "$upd_pass" ]] && proxy_url="socks5h://${upd_user}:${upd_pass}@${upd_addr}"
+            curl_opts+=(--proxy "$proxy_url")
+            step "Using saved proxy for update: ${upd_user:+${upd_user}@}${upd_addr}"
+        fi
+    elif [[ -n "${PROXY_ADDR:-}" ]]; then
+        curl_opts+=(--proxy "socks5h://${PROXY_ADDR}")
+    fi
 
     step "Checking latest version from GitHub..."
     local remote_ver
@@ -470,18 +523,150 @@ setup_server() {
 #  SOCKS5 proxy ask
 # ─────────────────────────────────────────────────────
 
+save_proxy_conf() {
+    # ذخیره تنظیمات پروکسی در فایل
+    local addr="$1" user="$2" enc_pass="$3"
+    local tmp; tmp=$(mktemp "${PROXY_CONF_FILE}.XXXXXX")
+    {
+        echo "PROXY_ADDR=${addr}"
+        echo "PROXY_USER=${user}"
+        echo "PROXY_ENC_PASS=${enc_pass}"
+    } > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$PROXY_CONF_FILE"
+    ok "Proxy settings saved to $PROXY_CONF_FILE"
+}
+
+load_proxy_conf() {
+    # بارگذاری تنظیمات پروکسی از فایل
+    PROXY_ADDR=""; PROXY_USER=""; PROXY_PASS=""; PROXY_CMD=""; APT_PROXY_ARGS=""
+    [[ ! -f "$PROXY_CONF_FILE" ]] && return 1
+    local saved_addr saved_user saved_enc
+    saved_addr=$(grep "^PROXY_ADDR=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+    saved_user=$(grep "^PROXY_USER=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+    saved_enc=$(grep "^PROXY_ENC_PASS=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+    [[ -z "$saved_addr" ]] && return 1
+
+    PROXY_ADDR="$saved_addr"
+    PROXY_USER="$saved_user"
+
+    if [[ -n "$saved_enc" ]]; then
+        if [[ "$saved_enc" == plain:* ]]; then
+            PROXY_PASS=$(printf '%s' "${saved_enc#plain:}" | base64 -d 2>/dev/null)
+        else
+            PROXY_PASS=$(printf '%s' "$saved_enc" | base64 -d 2>/dev/null \
+                | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+                  -pass "pass:$(_enc_key)" 2>/dev/null)
+        fi
+    fi
+
+    _build_proxy_cmd
+    return 0
+}
+
+_build_proxy_cmd() {
+    # ساخت PROXY_CMD و APT_PROXY_ARGS از متغیرهای موجود
+    PROXY_CMD=""; APT_PROXY_ARGS=""
+    [[ -z "$PROXY_ADDR" ]] && return
+
+    local ph="${PROXY_ADDR%:*}" pp="${PROXY_ADDR##*:}"
+
+    if [[ -n "$PROXY_USER" && -n "$PROXY_PASS" ]]; then
+        # پروکسی با یوزر/پسورد
+        local nc_auth="-P ${PROXY_USER}"
+        # nc نسخه‌های قدیمی با -P کار نمی‌کنن، از connect استفاده می‌کنیم
+        # روش سازگار: استفاده از corkscrew یا نوشتن یه wrapper
+        PROXY_CMD="ProxyCommand=nc -x ${ph}:${pp} -X 5 -P ${PROXY_USER} %h %p"
+        local auth_part="${PROXY_USER}:${PROXY_PASS}@"
+        APT_PROXY_ARGS="-o Acquire::http::proxy=\"socks5h://${auth_part}${PROXY_ADDR}\" -o Acquire::https::proxy=\"socks5h://${auth_part}${PROXY_ADDR}\""
+        export http_proxy="socks5h://${auth_part}${PROXY_ADDR}"
+        export https_proxy="socks5h://${auth_part}${PROXY_ADDR}"
+        # ساخت یه wrapper script برای ssh ProxyCommand که auth رو handle کنه
+        _ensure_proxy_wrapper "$ph" "$pp" "$PROXY_USER" "$PROXY_PASS"
+        PROXY_CMD="ProxyCommand=/usr/local/bin/ssh-proxy-wrapper %h %p"
+    else
+        # پروکسی بدون auth
+        PROXY_CMD="ProxyCommand=nc -x ${ph}:${pp} -X 5 %h %p"
+        APT_PROXY_ARGS="-o Acquire::http::proxy=\"socks5h://${PROXY_ADDR}\" -o Acquire::https::proxy=\"socks5h://${PROXY_ADDR}\""
+        export http_proxy="socks5h://${PROXY_ADDR}"
+        export https_proxy="socks5h://${PROXY_ADDR}"
+    fi
+}
+
+_ensure_proxy_wrapper() {
+    # یه wrapper script کوچک برای nc با احراز هویت SOCKS5
+    local ph="$1" pp="$2" pu="$3" ppass="$4"
+    cat > /usr/local/bin/ssh-proxy-wrapper << WRAPPER_EOF
+#!/bin/bash
+# FluxTunnel SOCKS5 auth wrapper — auto-generated
+TARGET_HOST="\$1"
+TARGET_PORT="\$2"
+exec python3 -c "
+import socket, struct, sys
+
+def socks5_connect(proxy_host, proxy_port, dest_host, dest_port, username, password):
+    s = socket.socket()
+    s.connect((proxy_host, int(proxy_port)))
+    # handshake با auth
+    s.sendall(b'\x05\x01\x02')
+    resp = s.recv(2)
+    if resp[1] == 2:
+        auth = b'\x01' + bytes([len(username)]) + username.encode() + bytes([len(password)]) + password.encode()
+        s.sendall(auth)
+        if s.recv(2)[1] != 0:
+            sys.exit('Auth failed')
+    elif resp[1] != 0:
+        sys.exit('No acceptable auth method')
+    # connect request
+    host_bytes = dest_host.encode()
+    req = b'\x05\x01\x00\x03' + bytes([len(host_bytes)]) + host_bytes + struct.pack('>H', int(dest_port))
+    s.sendall(req)
+    s.recv(10)
+    # relay stdin/stdout
+    import select, os
+    while True:
+        r, _, _ = select.select([s, sys.stdin.buffer], [], [])
+        if s in r:
+            d = s.recv(4096)
+            if not d: break
+            sys.stdout.buffer.write(d); sys.stdout.buffer.flush()
+        if sys.stdin.buffer in r:
+            d = sys.stdin.buffer.read1(4096)
+            if not d: break
+            s.sendall(d)
+
+socks5_connect('${ph}', '${pp}', '\$TARGET_HOST', '\$TARGET_PORT', '${pu}', '${ppass}')
+" 2>/dev/null
+WRAPPER_EOF
+    chmod 755 /usr/local/bin/ssh-proxy-wrapper
+    ok "SOCKS5 auth wrapper installed: /usr/local/bin/ssh-proxy-wrapper"
+}
+
 ask_proxy() {
     echo ""
     echo -e "  ${BOLD}Proxy Configuration${NC}"
     echo -e "  ${DIM}Required if outbound SSH is blocked on this server${NC}"
     echo ""
+
+    # نمایش تنظیمات فعلی اگه وجود داشته باشه
+    if [[ -f "$PROXY_CONF_FILE" ]]; then
+        local cur_addr; cur_addr=$(grep "^PROXY_ADDR=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+        local cur_user; cur_user=$(grep "^PROXY_USER=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+        if [[ -n "$cur_addr" ]]; then
+            local cur_info="$cur_addr"
+            [[ -n "$cur_user" ]] && cur_info="${cur_user}@${cur_addr}"
+            echo -e "  ${DIM}Current proxy: ${CYAN}${cur_info}${NC}"
+            echo ""
+        fi
+    fi
+
     echo "    1) Yes — I have a SOCKS5 proxy"
     echo "    2) No  — connect directly"
     echo ""
     read -rp "  Choice [1/2, default 2]: " PROXY_CHOICE
     PROXY_CHOICE=${PROXY_CHOICE:-2}
 
-    PROXY_CMD=""; PROXY_ADDR=""; APT_PROXY_ARGS=""
+    PROXY_CMD=""; PROXY_ADDR=""; PROXY_USER=""; PROXY_PASS=""; APT_PROXY_ARGS=""
 
     if [[ "$PROXY_CHOICE" == "1" ]]; then
         echo ""
@@ -489,10 +674,134 @@ ask_proxy() {
         [[ -z "$PROXY_ADDR" ]] && { err "Proxy address required"; exit 1; }
         local ph="${PROXY_ADDR%:*}" pp="${PROXY_ADDR##*:}"
         [[ -z "$ph" || -z "$pp" ]] && { err "Format: host:port"; exit 1; }
-        PROXY_CMD="ProxyCommand=nc -x ${ph}:${pp} -X 5 %h %p"
-        APT_PROXY_ARGS="-o Acquire::http::proxy=\"socks5h://${PROXY_ADDR}\" -o Acquire::https::proxy=\"socks5h://${PROXY_ADDR}\""
-        ok "SOCKS5 proxy: $PROXY_ADDR"
+
+        echo ""
+        read -rp "  Proxy username (Enter=none): " PROXY_USER
+        if [[ -n "$PROXY_USER" ]]; then
+            read -rsp "  Proxy password: " PROXY_PASS; echo ""
+            [[ -z "$PROXY_PASS" ]] && { err "Password required when username is set"; exit 1; }
+        fi
+
+        _build_proxy_cmd
+
+        # ذخیره تنظیمات پروکسی
+        local enc_pass=""
+        if [[ -n "$PROXY_PASS" ]]; then
+            if command -v openssl &>/dev/null; then
+                enc_pass=$(printf '%s' "$PROXY_PASS" \
+                    | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
+                      -pass "pass:$(_enc_key)" 2>/dev/null \
+                    | base64 -w0)
+                [[ -z "$enc_pass" ]] && enc_pass="plain:$(printf '%s' "$PROXY_PASS" | base64 -w0)"
+            else
+                enc_pass="plain:$(printf '%s' "$PROXY_PASS" | base64 -w0)"
+            fi
+        fi
+        save_proxy_conf "$PROXY_ADDR" "$PROXY_USER" "$enc_pass"
+
+        local disp_addr="$PROXY_ADDR"
+        [[ -n "$PROXY_USER" ]] && disp_addr="${PROXY_USER}@${PROXY_ADDR}"
+        ok "SOCKS5 proxy: $disp_addr"
     fi
+}
+
+# ─────────────────────────────────────────────────────
+#  Change Proxy — تغییر یا حذف پروکسی برای تانل‌های موجود
+# ─────────────────────────────────────────────────────
+
+change_proxy() {
+    banner
+    echo -e "${BOLD}  ► Change / Remove Proxy${NC}"
+    hr; echo ""
+
+    if [[ -f "$PROXY_CONF_FILE" ]]; then
+        local cur_addr; cur_addr=$(grep "^PROXY_ADDR=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+        local cur_user; cur_user=$(grep "^PROXY_USER=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+        if [[ -n "$cur_addr" ]]; then
+            local cur_info="$cur_addr"
+            [[ -n "$cur_user" ]] && cur_info="${cur_user}@${cur_addr}"
+            echo -e "  Current proxy: ${CYAN}${BOLD}${cur_info}${NC}"; echo ""
+        else
+            echo -e "  Current proxy: ${DIM}none${NC}"; echo ""
+        fi
+    else
+        echo -e "  Current proxy: ${DIM}none${NC}"; echo ""
+    fi
+
+    echo "  1) Set new proxy (with or without auth)"
+    echo "  2) Remove proxy (direct connection)"
+    echo "  0) Cancel"
+    echo ""
+    read -rp "  Choice: " CH
+    case "$CH" in
+        1)
+            echo ""
+            read -rp "  New SOCKS5 address (host:port): " NEW_ADDR
+            [[ -z "$NEW_ADDR" ]] && { warn "Cancelled"; sleep 1; return; }
+            local ph="${NEW_ADDR%:*}" pp="${NEW_ADDR##*:}"
+            [[ -z "$ph" || -z "$pp" ]] && { err "Format: host:port"; sleep 1; return; }
+
+            read -rp "  Proxy username (Enter=none): " NEW_USER
+            local NEW_PASS="" new_enc=""
+            if [[ -n "$NEW_USER" ]]; then
+                read -rsp "  Proxy password: " NEW_PASS; echo ""
+                [[ -z "$NEW_PASS" ]] && { err "Password required"; sleep 1; return; }
+                if command -v openssl &>/dev/null; then
+                    new_enc=$(printf '%s' "$NEW_PASS" \
+                        | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
+                          -pass "pass:$(_enc_key)" 2>/dev/null \
+                        | base64 -w0)
+                    [[ -z "$new_enc" ]] && new_enc="plain:$(printf '%s' "$NEW_PASS" | base64 -w0)"
+                else
+                    new_enc="plain:$(printf '%s' "$NEW_PASS" | base64 -w0)"
+                fi
+            fi
+            save_proxy_conf "$NEW_ADDR" "$NEW_USER" "$new_enc"
+
+            # آپدیت ProxyCommand در همه تانل‌ها
+            local NEW_PC=""
+            PROXY_ADDR="$NEW_ADDR"; PROXY_USER="$NEW_USER"; PROXY_PASS="$NEW_PASS"
+            if [[ -n "$NEW_USER" && -n "$NEW_PASS" ]]; then
+                _ensure_proxy_wrapper "$ph" "$pp" "$NEW_USER" "$NEW_PASS"
+                NEW_PC="ProxyCommand=/usr/local/bin/ssh-proxy-wrapper %h %p"
+            else
+                NEW_PC="ProxyCommand=nc -x ${ph}:${pp} -X 5 %h %p"
+            fi
+
+            _update_all_tunnels_proxy "$NEW_PC"
+            local disp="$NEW_ADDR"; [[ -n "$NEW_USER" ]] && disp="${NEW_USER}@${NEW_ADDR}"
+            ok "Proxy updated: $disp"
+            ;;
+        2)
+            rm -f "$PROXY_CONF_FILE"
+            rm -f /usr/local/bin/ssh-proxy-wrapper 2>/dev/null
+            _update_all_tunnels_proxy ""
+            ok "Proxy removed — all tunnels set to direct connection"
+            ;;
+        0) return ;;
+        *) warn "Invalid choice"; sleep 1; return ;;
+    esac
+
+    local mode=""
+    [[ -f "$MODE_FILE" ]] && mode=$(cat "$MODE_FILE")
+    if [[ "$mode" == "client" ]]; then
+        generate_tunnel_script
+        systemctl restart ssh-tunnel && ok "Service restarted with new proxy"
+    fi
+    echo ""; read -rp "  [Press Enter to return]"
+}
+
+_update_all_tunnels_proxy() {
+    local new_pc="$1"
+    [[ ! -s "$TUNNELS_FILE" ]] && return
+    local tmp; tmp=$(mktemp "${TUNNELS_FILE}.XXXXXX")
+    while IFS='|' read -r ID RU RH SP TP LP PC; do
+        [[ -z "$ID" || "$ID" == \#* ]] && continue
+        echo "${ID}|${RU}|${RH}|${SP}|${TP}|${LP}|${new_pc}" >> "$tmp"
+    done < "$TUNNELS_FILE"
+    chmod 600 "$tmp"
+    mv "$tmp" "$TUNNELS_FILE"
+    ok "All tunnel ProxyCommands updated"
 }
 
 # ─────────────────────────────────────────────────────
@@ -664,7 +973,7 @@ generate_tunnel_script() {
     step "Generating tunnel runner..."
     cat > "$TUNNEL_SCRIPT" << 'SCRIPT_EOF'
 #!/bin/bash
-# Auto-generated by FluxTunnel v0.3.0 — do not edit manually
+# Auto-generated by FluxTunnel v0.4.0 — do not edit manually
 CONFIG_DIR="/etc/ssh-tunnel"
 TUNNELS_FILE="$CONFIG_DIR/tunnels.conf"
 AUTH_FILE="$CONFIG_DIR/auth.conf"
@@ -1101,12 +1410,29 @@ main() {
     ensure_config_dir
     PROXY_ADDR=""
 
+    # migrate تنظیمات پروکسی قدیمی به فرمت جدید
+    migrate_proxy_conf
+
     while true; do
         banner
 
         show_status_line
         local tcnt; tcnt=$(grep -c "^[^#]" "$TUNNELS_FILE" 2>/dev/null || echo 0)
         echo -e "  Tunnels : ${BOLD}${tcnt}${NC} configured"
+
+        # نمایش وضعیت پروکسی فعلی
+        if [[ -f "$PROXY_CONF_FILE" ]]; then
+            local mn_addr; mn_addr=$(grep "^PROXY_ADDR=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+            local mn_user; mn_user=$(grep "^PROXY_USER=" "$PROXY_CONF_FILE" 2>/dev/null | cut -d= -f2-)
+            if [[ -n "$mn_addr" ]]; then
+                local mn_disp="$mn_addr"; [[ -n "$mn_user" ]] && mn_disp="${mn_user}@${mn_addr}"
+                echo -e "  Proxy   : ${CYAN}${mn_disp}${NC}"
+            else
+                echo -e "  Proxy   : ${DIM}none (direct)${NC}"
+            fi
+        else
+            echo -e "  Proxy   : ${DIM}none (direct)${NC}"
+        fi
 
         echo ""; hr; echo ""
         echo "  1)  Client Setup    — Iran server creates tunnel to VPS"
@@ -1119,6 +1445,7 @@ main() {
         echo "  8)  View live logs"
         echo "  9)  Update script"
         echo "  10) Uninstall"
+        echo "  11) Change Proxy"
         echo "  0)  Exit"
         echo ""; hr
         read -rp "  Choice: " CHOICE
@@ -1159,6 +1486,7 @@ main() {
                 ;;
             9)  self_update ;;
             10) uninstall_all ;;
+            11) change_proxy ;;
             0)  echo ""; exit 0 ;;
             *)  warn "Invalid choice"; sleep 1 ;;
         esac
